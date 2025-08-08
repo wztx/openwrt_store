@@ -18,7 +18,7 @@
 | luci-app-nekobox               | 代理工具      | [Thaolga/luci-app-nekobox](https://github.com/Thaolga/openwrt-nekobox)       |
 | luci-app-nikki                 | 代理工具               | [nikkinikki-org/nikki](https://github.com/nikkinikki-org/OpenWrt-nikki)                                                                     |
 | luci-app-passwall2             | 代理工具           | [xiaorouji/openwrt-passwall2](https://github.com/xiaorouji/openwrt-passwall2)       |
-| luci-app-ssr-plus              | 代理工具                | [coolsnowwolf/luci-app-ssr-plus](https://github.com/coolsnowwolf/luci-app-ssr-plus) |
+| luci-app-ssr-plus              | 代理工具                | [coolsnowwolf/luci-app-ssr-plus](https://github.com/fw876/helloworld) |
 | tailscale             | ZeroTier 类似的 VPN 工具，基于 WireGuard | [tailscale/tailscale](https://github.com/tailscale/tailscale)                       |
 
 ## ❤️其它GitHub Action项目推荐🌟 （建议收藏）⬇️
