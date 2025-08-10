@@ -20,7 +20,11 @@
 | luci-app-passwall2             | 代理工具           | [xiaorouji/openwrt-passwall2](https://github.com/xiaorouji/openwrt-passwall2)       |
 | luci-app-ssr-plus              | 代理工具                | [coolsnowwolf/luci-app-ssr-plus](https://github.com/fw876/helloworld) |
 | tailscale             | ZeroTier 类似的 VPN 工具，基于 WireGuard | [tailscale/tailscale](https://github.com/tailscale/tailscale)                       |
+| luci-app-lucky           | Lucky大吉,软硬路由公网神器,ipv6/ipv4 端口转发,反向代理 | [程序 gdy666/lucky](https://github.com/gdy666/lucky) [ipk仓库](https://dl.openwrt.ai/packages-24.10/aarch64_cortex-a53/kiddin9/)                      |
+| 未完待续             | 未完待续 | 未完待续                       |
 
+## 如何集成到AutoBuildImmortalWrt
+https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209
 ## ❤️其它GitHub Action项目推荐🌟 （建议收藏）⬇️
 - ### [一键生成run插件] 🆕
 - https://github.com/wukongdaily/RunFilesBuilder<br>
