@@ -21,6 +21,7 @@
 | luci-app-ssr-plus              | 代理工具                | [coolsnowwolf/luci-app-ssr-plus](https://github.com/fw876/helloworld) |
 | tailscale             | ZeroTier 类似的 VPN 工具，基于 WireGuard | [tailscale/tailscale](https://github.com/tailscale/tailscale)                       |
 | luci-app-lucky           | Lucky大吉,软硬路由公网神器,ipv6/ipv4 端口转发,反向代理 | [程序 gdy666/lucky](https://github.com/gdy666/lucky) [ipk仓库](https://dl.openwrt.ai/packages-24.10/aarch64_cortex-a53/kiddin9/)                      |
+| luci-app-gecoosac           | 集客AP                | [lwb1978/openwrt-gecoosac](https://github.com/lwb1978/openwrt-gecoosac) |
 | 未完待续             | 未完待续 | 未完待续                       |
 
 ## 如何集成到AutoBuildImmortalWrt
