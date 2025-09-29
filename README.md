@@ -22,7 +22,9 @@
 | tailscale             | ZeroTier 类似的 VPN 工具，基于 WireGuard | [tailscale/tailscale](https://github.com/tailscale/tailscale)                       |
 | luci-app-lucky           | Lucky大吉,软硬路由公网神器,ipv6/ipv4 端口转发,反向代理 | [程序 gdy666/lucky](https://github.com/gdy666/lucky) [ipk仓库](https://dl.openwrt.ai/packages-24.10/aarch64_cortex-a53/kiddin9/)                      |
 | luci-app-gecoosac           | 集客AC                | [lwb1978/openwrt-gecoosac](https://github.com/lwb1978/openwrt-gecoosac) |
-| 未完待续             | 未完待续 | 未完待续                       |
+| luci-app-taskplan             | 任务计划 |                        |
+| luci-app-easytier             | 组网 | https://github.com/EasyTier/luci-app-easytier                       |
+| luci-app-unishare             | 统一文件共享 | webdav共享                      |
 
 ## 如何集成到AutoBuildImmortalWrt
 https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209
