@@ -25,6 +25,7 @@
 | luci-app-taskplan             | 任务计划 |                        |
 | luci-app-easytier             | 组网 | https://github.com/EasyTier/luci-app-easytier                       |
 | luci-app-unishare             | 统一文件共享 | webdav共享                      |
+| luci-app-bandix               | 网络流量监控 | [timsaya/luci-app-bandix](https://github.com/timsaya/luci-app-bandix) |
 
 ## 如何集成到AutoBuildImmortalWrt
 https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209
