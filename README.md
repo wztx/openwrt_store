@@ -26,6 +26,7 @@
 | luci-app-easytier             | 组网 | https://github.com/EasyTier/luci-app-easytier                       |
 | luci-app-unishare             | 统一文件共享 | webdav共享                      |
 | luci-app-bandix               | 网络流量监控 | [timsaya/luci-app-bandix](https://github.com/timsaya/luci-app-bandix) [bandix](https://github.com/timsaya/openwrt-bandix) |
+| luci-app-openlist2            | 文件列表程序 | [OpenListTeam/OpenList](https://github.com/OpenListTeam/OpenList) [Openlist](https://doc.oplist.org/) |
 
 ## 如何集成到AutoBuildImmortalWrt
 https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209
