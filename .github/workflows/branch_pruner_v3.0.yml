@@ -1,0 +1,88 @@
+# Branch-Pruner | GitHub Action
+# 
+# Description: 清理选定分支的历史提交记录
+# Author: Container
+# Version: v3.0
+# Source: https://github.com/Container-Zero/Branch-Pruner-Action
+# License: MIT
+# Filename: branch_pruner_v3.0.yml
+# Copyright (c) 2023 Container
+#
+# CAUTION: 使用风险自负，清除历史记录大调操作无法撤消，请在使用之前备份您的数据。
+
+name: Branch Pruner V3.0
+
+env:
+  MASTER_BRANCH: "$(echo ${{ github.ref }} | cut -d'/' -f3)"
+  TEMP_BRANCH: "temp_77743FCC_85C1_4C4D_9A8D_B0130469B4F7"
+
+on:
+  # schedule: 
+  #   - cron: '00 23 28 * *' # 例如，每月28日23:00
+  workflow_dispatch:
+    # inputs:
+      # master_branch:
+      #   description: '输入你要清除历史提交记录的分支名称'
+      #   required: true
+      #   default: 'master'
+      # temp_branch:
+      #   description: '在清除时会创建一个临时分支用于中转，并于之后删除，输入你想要在这个过程中创建的临时分支名称，注意！严禁使用你项目中已存在的分支名！'
+      #   required: true
+      #   default: 'temp_77743FCC_85C1_4C4D_9A8D_B0130469B4F7'
+  
+jobs:
+  branch-pruner-action:
+    name: Branch pruner action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Enter personal information
+        run: |
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com' #提交时使用的email
+          git config --global user.name 'Branch-Pruner[Action-Bot]' #提交时使用的用户名
+
+      - name: Remote temp branch # 删除远程的temp分支（如果存在则删除，没有则跳过）
+        run: | 
+          BRANCH=$(git ls-remote --heads origin refs/heads/${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }})
+          if [ -n "$BRANCH" ]; then
+            echo "Remote branch ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} exists, deleting it..."
+            git push origin --delete ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }}
+          else
+            echo "Remote branch ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} does not exist, nothing to do."
+          fi
+          
+      - name: Create temp branch # 创建temp分支
+        run: | 
+          git checkout --orphan ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} # 创建一个孤儿分支 temp
+          git rm -rf . # 删除所有文件
+          git commit --allow-empty -m "Initial commit on empty branch" # 创建一个空提交
+          git push origin ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} # 推送到远程仓库
+          
+      - name: Add files config # 在添加文件前进行正确的设置
+        run: |
+          git config --global core.quotepath false #强制正确显示中文
+          
+      - name: Add files # 添加文件
+        run: |
+          git checkout  ${{ github.event.inputs.master_branch || env.MASTER_BRANCH }} # 切换到master分支
+          IFS=$(echo -en "\\n\\b") # 强制以换行符分割获取到的文件名，而非空格符，使带空格的文件与文件夹能正常显示（要写在ls-files代码上一行）
+          files=$(git ls-files)  # 获取master分支上的所有文件列表
+          for file in $files; do # 遍历每个文件
+            git checkout ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} # 切换到temp分支
+            git checkout  ${{ github.event.inputs.master_branch || env.MASTER_BRANCH }} -- $file # 检出master分支上的当前文件
+            git add $file # 添加到暂存区
+            git commit -m "Add $file" # 提交并附加文件名作为消息
+            git push origin ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }} # 推送到远程temp分支
+          done
+          
+      - name: Point the main branch pointer to the temporary branch and delete the temporary branch # 将主分支指针指向临时分支，并删除临时分支
+        run: |
+          git branch --force ${{ github.event.inputs.master_branch || env.MASTER_BRANCH }} ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }}
+          git push --force origin ${{ github.event.inputs.master_branch || env.MASTER_BRANCH }}
+          git push origin --delete ${{ github.event.inputs.temp_branch || env.TEMP_BRANCH }}
+      
+      - name: Run garbage collection and remove traces of not used branch # 执行垃圾回收，从仓库中彻底去掉未使用的分支的痕迹
+        run: |
+          git gc --prune=now # 删除所有孤立的对象
