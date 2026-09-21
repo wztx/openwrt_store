@@ -1,0 +1,192 @@
+#=================================================
+# https://github.com/wztx/openwrt_store/
+# Description: Build RunFiles using GitHub Actions
+# Lisence: MIT
+# Author: wztx
+# Blog: lpfcdn.com
+#=================================================
+
+name: MosDNS Openwrt24版本
+
+on:
+  schedule:
+    - cron: "9 22 * * *"  # 北京时间早上 6 点09
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: mosdns-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建mosdns并提交到本仓库
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: 拉取存储库（获取完整历史记录）
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # 拉取完整历史以便判断是否有变更
+
+      - name: 从上游获取最新发布标签
+        id: fetch_latest_tag
+        run: |
+          latest_tag=$(curl -s https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest | jq -r '.tag_name')
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+          echo "最新上游版本: $latest_tag"
+
+      - name: 配置北京时间和版本变化
+        id: vars
+        run: |
+          BUILD_TIME=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
+          TODAY=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+          echo "BUILD_TIME=$BUILD_TIME" >> $GITHUB_ENV
+          echo "tag_name=$TODAY" >> $GITHUB_ENV
+          echo "X86_FILE=mosdns_${LATEST_TAG}_x86_64.run" >> $GITHUB_ENV
+          echo "ARM64_FILE=mosdns_${LATEST_TAG}_aarch64_cortex-a53.run" >> $GITHUB_ENV
+
+      - name: 检查是否已经是最新的（如果存储库中存在相同的版本，则跳过）
+        id: check_version
+        run: |
+          X86_EXISTS="false"
+          ARM64_EXISTS="false"
+          if [ -f "run/x86/${{ env.X86_FILE }}" ]; then
+            X86_EXISTS="true"
+            echo "x86 版本已存在: run/x86/${{ env.X86_FILE }}"
+          fi
+          if [ -f "run/arm64/${{ env.ARM64_FILE }}" ]; then
+            ARM64_EXISTS="true"
+            echo "arm64 版本已存在: run/arm64/${{ env.ARM64_FILE }}"
+          fi
+          if [ "$X86_EXISTS" = "true" ] && [ "$ARM64_EXISTS" = "true" ]; then
+            echo "NO_UPDATE=true" >> $GITHUB_ENV
+            echo "✅ 仓库中已是最新版本 ${{ env.LATEST_TAG }}，跳过构建与上传。"
+          else
+            echo "NO_UPDATE=false" >> $GITHUB_ENV
+            echo "🚀 检测到新版本或文件缺失，开始构建..."
+          fi
+
+      - name: 克隆存储库
+        if: env.NO_UPDATE != 'true'
+        run: git clone https://github.com/megastep/makeself.git
+
+      - name: 下载最新的mosdns文件
+        if: env.NO_UPDATE != 'true'
+        run: |
+          curl -LO $(curl -s https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest | grep -oP '"browser_download_url":\s*".*aarch64_cortex-a53-openwrt-24.10.tar.gz"' | cut -d '"' -f 4)
+          curl -LO $(curl -s https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest | grep -oP '"browser_download_url":\s*".*x86_64-openwrt-24.10.tar.gz"' | cut -d '"' -f 4)
+          tar --one-top-level=aarch64_cortex-a53-openwrt-24.10 -xvzf aarch64_cortex-a53-openwrt-24.10.tar.gz
+          tar --one-top-level=x86_64-openwrt-24.10 -xvzf x86_64-openwrt-24.10.tar.gz
+
+      - name: 整理文件 aarch64_cortex-a53 & x86_64
+        if: env.NO_UPDATE != 'true'
+        run: |
+          mkdir mosdns_x86_64 mosdns_aarch64_cortex-a53
+          cp x86_64-openwrt-24.10/packages_ci/*.ipk mosdns_x86_64/
+          cp aarch64_cortex-a53-openwrt-24.10/packages_ci/*.ipk mosdns_aarch64_cortex-a53/
+          # 去除文件名中的 ~ 字符
+          pushd "mosdns_x86_64" >/dev/null || exit 1
+          for file in *~*.ipk; do
+            [ -e "$file" ] || continue
+            new_file="$(echo "$file" | tr -d '~')"
+            if [ -e "$new_file" ]; then
+              echo "目标文件已存在，跳过: $new_file"
+              continue
+            fi
+            mv "$file" "$new_file"
+            echo "已重命名: $file -> $new_file"
+          done
+          popd >/dev/null
+          pushd "mosdns_aarch64_cortex-a53" >/dev/null || exit 1
+          for file in *~*.ipk; do
+            [ -e "$file" ] || continue
+            new_file="$(echo "$file" | tr -d '~')"
+            if [ -e "$new_file" ]; then
+              echo "目标文件已存在，跳过: $new_file"
+              continue
+            fi
+            mv "$file" "$new_file"
+            echo "已重命名: $file -> $new_file"
+          done
+          popd >/dev/null
+
+      - name: 创建install.sh脚本
+        if: env.NO_UPDATE != 'true'
+        run: |
+          cat <<EOF > mosdns_x86_64/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "更新失败。"
+              exit 1
+          fi
+          opkg install *.ipk
+          EOF
+          chmod +x mosdns_x86_64/install.sh
+          cp mosdns_x86_64/install.sh mosdns_aarch64_cortex-a53/install.sh
+
+      - name: 将mosdns目录移至makeelf
+        if: env.NO_UPDATE != 'true'
+        run: |
+          mv mosdns_x86_64 makeself/
+          mv mosdns_aarch64_cortex-a53 makeself/
+
+      - name: 创建自解压包
+        if: env.NO_UPDATE != 'true'
+        run: |
+          cd makeself
+          ./makeself.sh mosdns_x86_64/ ${{ env.X86_FILE }} "by github action" ./install.sh
+          ./makeself.sh mosdns_aarch64_cortex-a53/ ${{ env.ARM64_FILE }} "by github action" ./install.sh
+          ls -lh *.run
+
+      - name: 准备运行目录并删除旧的构建工件
+        if: env.NO_UPDATE != 'true'
+        run: |
+          mkdir -p run/x86 run/arm64
+          # 只删除与构建相关的旧 .run 文件，禁止删除其它文件
+          echo "清理 x86 目录下旧版本 .run 文件..."
+          find run/x86 -maxdepth 1 -type f -name 'mosdns_*_x86_64.run' -print -delete || true
+          echo "清理 arm64 目录下旧版本 .run 文件..."
+          find run/arm64 -maxdepth 1 -type f -name 'mosdns_*_aarch64_cortex-a53.run' -print -delete || true
+
+      - name: 将新的构建文件上传到仓库
+        if: env.NO_UPDATE != 'true'
+        run: |
+          cp makeself/${{ env.X86_FILE }} run/x86/
+          cp makeself/${{ env.ARM64_FILE }} run/arm64/
+          echo "已复制:"
+          ls -lh run/x86/${{ env.X86_FILE }}
+          ls -lh run/arm64/${{ env.ARM64_FILE }}
+
+      - name: 提交并推送更改（仅在有更改时）
+        if: env.NO_UPDATE != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add run/x86/${{ env.X86_FILE }} run/arm64/${{ env.ARM64_FILE }}
+          # 检查是否有 staged 变更
+          if git diff --cached --quiet; then
+            echo "无文件变更，跳过提交。"
+            echo "HAS_CHANGE=false" >> $GITHUB_ENV
+          else
+            COMMIT_MSG="chore: update mosdns to ${{ env.LATEST_TAG }} (${{ env.BUILD_TIME }})"
+            echo "提交信息: $COMMIT_MSG"
+            git commit -m "$COMMIT_MSG"
+            git push
+            echo "HAS_CHANGE=true" >> $GITHUB_ENV
+          fi
+
+      - name: 删除构建缓存
+        if: always()
+        run: |
+          echo "清理运行缓存..."
+          rm -rf makeself
+          rm -rf aarch64_cortex-a53-openwrt-24.10 x86_64-openwrt-24.10
+          rm -f aarch64_cortex-a53-openwrt-24.10.tar.gz x86_64-openwrt-24.10.tar.gz
+          rm -rf mosdns_x86_64 mosdns_aarch64_cortex-a53
+          echo "✅ 缓存清理完成。"

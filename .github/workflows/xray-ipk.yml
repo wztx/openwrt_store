@@ -1,0 +1,225 @@
+# ============================================================
+# Xray-core OpenWrt IPK 自动构建工作流
+# 功能：自动从 XTLS/Xray-core 官方 releases 拉取最新版本，
+#       打包为 OpenWrt 可用的 .ipk 安装包，自动对比版本、提交更新。
+# 触发方式：
+#   1. 定时触发（每天6点40分）
+#   2. 手动触发（workflow_dispatch）
+# 输出路径：
+#   - x86_64 架构：run/x86/xray/
+#   - aarch64 架构：run/arm64/xray/
+# 设计原则：
+#   - 以.ipk文件名作为版本对比依据，已有对应版本则跳过
+#   - 仅删除Xray-core旧版本ipk，绝不影响仓库中其他文件
+#   - 仅生成.ipk文件，不产生任何冗余文件
+#   - 提交信息自动携带版本号和构建时间
+#   - 构建完成自动清理临时缓存
+# ============================================================
+
+name: Xray-core IPK 安装包
+
+on:
+  schedule:
+    - cron: "40 22 * * *"  # 北京时间早上 6 点 30
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: xray-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建并上传 Xray-core IPK
+    runs-on: ubuntu-26.04
+    
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 切换到正确工作目录，避免目录漂移
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          echo "工作目录: $(pwd)"
+
+      - name: 获取Xray-core最新版本
+        id: ver
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          LATEST=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases \
+          | jq -r 'sort_by(.published_at) | reverse | map(select(.prerelease==true)) | .[0].tag_name')
+          echo "version=${LATEST}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+          echo "检测到Xray-core版本: ${LATEST}"
+
+      - name: 版本检查
+        id: check
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          VER="${{ steps.ver.outputs.version }}"
+          VER_SHORT="${VER#v}"
+          IPK_X86="xray-core_${VER_SHORT}-1_x86_64.ipk"
+          IPK_ARM64="xray-core_${VER_SHORT}-1_aarch64_generic.ipk"
+          echo "ipk_x86=${IPK_X86}" >> $GITHUB_OUTPUT
+          echo "ipk_arm64=${IPK_ARM64}" >> $GITHUB_OUTPUT
+          
+          NEED_X86="false"
+          NEED_ARM64="false"
+          
+          if [ ! -f "run/x86/xray/${IPK_X86}" ]; then
+            NEED_X86="true"
+            echo "x86需要构建新版本"
+          else
+            echo "x86版本已存在，跳过"
+          fi
+          
+          if [ ! -f "run/arm64/xray/${IPK_ARM64}" ]; then
+            NEED_ARM64="true"
+            echo "arm64需要构建新版本"
+          else
+            echo "arm64版本已存在，跳过"
+          fi
+          
+          echo "need_x86=${NEED_X86}" >> $GITHUB_OUTPUT
+          echo "need_arm64=${NEED_ARM64}" >> $GITHUB_OUTPUT
+
+      - name: 构建x86_64 IPK包
+        if: steps.check.outputs.need_x86 == 'true'
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE}"
+          VER="${{ steps.ver.outputs.version }}"
+          VER_SHORT="${VER#v}"
+          IPK_NAME="${{ steps.check.outputs.ipk_x86 }}"
+          BUILD_DIR="${GITHUB_WORKSPACE}/build_x86"
+          
+          echo "=== 开始构建x86_64: ${IPK_NAME} ==="
+          rm -rf "${BUILD_DIR}"
+          mkdir -p "${BUILD_DIR}/control" "${BUILD_DIR}/data/usr/bin"
+          
+          cd "${BUILD_DIR}"
+          wget -q "https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-64.zip" -O xray.zip
+          unzip -q -o xray.zip
+          chmod +x xray
+          cp xray data/usr/bin/xray
+          
+          echo "2.0" > debian-binary
+          
+          # 写control文件
+          INSTALL_SIZE=$(du -sk data/usr/bin/xray | cut -f1)
+          printf 'Package: xray-core\nVersion: %s-1\nDepends: libc, libpthread, libstdcpp\nSection: net\nPriority: optional\nArchitecture: x86_64\nInstalled-Size: %s\nMaintainer: XTLS Xray-core Project\nDescription: Xray-core is a platform for building proxies\n Xray, Penetrates Everything. Also the best v2ray-core, with XTLS support.\n' "${VER_SHORT}" "${INSTALL_SIZE}" > control/control
+          
+          # 写postinst
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n    chmod 755 /usr/bin/xray 2>/dev/null || true\n}\nexit 0\n' > control/postinst
+          chmod 755 control/postinst
+          
+          # 写prerm
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n    /etc/init.d/xray stop 2>/dev/null || true\n}\nexit 0\n' > control/prerm
+          chmod 755 control/prerm
+          
+          # 打包
+          cd control && tar czf ../control.tar.gz ./* && cd ..
+          cd data && tar czf ../data.tar.gz ./* && cd ..
+          ar r "${IPK_NAME}" debian-binary control.tar.gz data.tar.gz
+          
+          file "${IPK_NAME}"
+          
+          # 部署
+          mkdir -p "${GITHUB_WORKSPACE}/run/x86/xray"
+          echo "清理x86目录旧版本..."
+          find "${GITHUB_WORKSPACE}/run/x86/xray" -maxdepth 1 -type f -name "xray-core_*_x86_64.ipk" ! -name "${IPK_NAME}" -delete || true
+          mv "${IPK_NAME}" "${GITHUB_WORKSPACE}/run/x86/xray/"
+          
+          echo "x86_64构建完成: run/x86/xray/${IPK_NAME}"
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf "${BUILD_DIR}"
+
+      - name: 构建aarch64 IPK包
+        if: steps.check.outputs.need_arm64 == 'true'
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE}"
+          VER="${{ steps.ver.outputs.version }}"
+          VER_SHORT="${VER#v}"
+          IPK_NAME="${{ steps.check.outputs.ipk_arm64 }}"
+          BUILD_DIR="${GITHUB_WORKSPACE}/build_arm64"
+          
+          echo "=== 开始构建aarch64: ${IPK_NAME} ==="
+          rm -rf "${BUILD_DIR}"
+          mkdir -p "${BUILD_DIR}/control" "${BUILD_DIR}/data/usr/bin"
+          
+          cd "${BUILD_DIR}"
+          wget -q "https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-arm64-v8a.zip" -O xray.zip
+          unzip -q -o xray.zip
+          chmod +x xray
+          cp xray data/usr/bin/xray
+          
+          echo "2.0" > debian-binary
+          
+          # 写control文件
+          INSTALL_SIZE=$(du -sk data/usr/bin/xray | cut -f1)
+          printf 'Package: xray-core\nVersion: %s-1\nDepends: libc, libpthread, libstdcpp\nSection: net\nPriority: optional\nArchitecture: aarch64_generic\nInstalled-Size: %s\nMaintainer: XTLS Xray-core Project\nDescription: Xray-core is a platform for building proxies\n Xray, Penetrates Everything. Also the best v2ray-core, with XTLS support.\n' "${VER_SHORT}" "${INSTALL_SIZE}" > control/control
+          
+          # 写postinst
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n    chmod 755 /usr/bin/xray 2>/dev/null || true\n}\nexit 0\n' > control/postinst
+          chmod 755 control/postinst
+          
+          # 写prerm
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n    /etc/init.d/xray stop 2>/dev/null || true\n}\nexit 0\n' > control/prerm
+          chmod 755 control/prerm
+          
+          # 打包
+          cd control && tar czf ../control.tar.gz ./* && cd ..
+          cd data && tar czf ../data.tar.gz ./* && cd ..
+          ar r "${IPK_NAME}" debian-binary control.tar.gz data.tar.gz
+          
+          file "${IPK_NAME}"
+          
+          # 部署
+          mkdir -p "${GITHUB_WORKSPACE}/run/arm64/xray"
+          echo "清理arm64目录旧版本..."
+          find "${GITHUB_WORKSPACE}/run/arm64/xray" -maxdepth 1 -type f -name "xray-core_*_aarch64_generic.ipk" ! -name "${IPK_NAME}" -delete || true
+          mv "${IPK_NAME}" "${GITHUB_WORKSPACE}/run/arm64/xray/"
+          
+          echo "aarch64构建完成: run/arm64/xray/${IPK_NAME}"
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf "${BUILD_DIR}"
+
+      - name: 提交并推送更新
+        if: steps.check.outputs.need_x86 == 'true' || steps.check.outputs.need_arm64 == 'true'
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add run/x86/xray/ run/arm64/xray/
+          git status
+          COMMIT_MSG="自动构建Xray-core ${{ steps.ver.outputs.version }} IPK安装包 - ${{ steps.ver.outputs.build_date }}"
+          echo "提交信息: ${COMMIT_MSG}"
+          git commit -m "${COMMIT_MSG}"
+          git push
+          echo "推送成功"
+
+      - name: 已是最新版本无需更新
+        if: steps.check.outputs.need_x86 != 'true' && steps.check.outputs.need_arm64 != 'true'
+        run: |
+          echo "=========================================="
+          echo "Xray-core ${{ steps.ver.outputs.version }} 已是最新版本"
+          echo "无需构建更新"
+          echo "=========================================="
+
+      - name: 最终清理缓存
+        if: always()
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf build_x86 build_arm64
+          rm -f xray.zip xray
+          echo "构建缓存已清理"
+          echo "=== 目录文件列表 ==="
+          ls -la run/x86/xray/ || true
+          ls -la run/arm64/xray/ || true

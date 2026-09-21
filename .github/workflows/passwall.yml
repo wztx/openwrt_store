@@ -1,0 +1,250 @@
+#=================================================
+# https://github.com/wztx/openwrt_store/
+# Description: Build RunFiles using GitHub Actions
+# Lisence: MIT
+# Author: wztx
+# Blog: lpfcdn.com
+#=================================================
+
+name: Passwall Openwrt24版本
+
+on:
+  schedule:
+    - cron: "3 22 * * *"  # 北京时间早上 6 点 03
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: passwall-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建passwall并提交到本仓库
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: 拉取存储库（获取完整历史记录）
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # 获取完整历史，用于版本对比和推送
+
+      - name: 配置Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 获取上游最新版本号
+        id: fetch_latest_tag
+        run: |
+          latest_tag=$(curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest | jq -r '.tag_name')
+          # 校验标签有效性：API 限流或网络异常时 tag_name 为 null，直接终止，避免生成错误版本号文件
+          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
+              echo "获取上游最新版本失败，终止本次构建。"
+              exit 1
+          fi
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+          echo "最新的Passwall版本: $latest_tag"
+
+      - name: 与本仓库已有文件进行版本对比
+        id: check_version
+        run: |
+          NEED_BUILD="false"
+          # 确保目录存在
+          mkdir -p run/x86 run/arm64
+
+          # 规范化最新版本号（去除可能的 v 前缀）
+          LATEST_VER=$(echo "${{ env.LATEST_TAG }}" | sed 's/^v//')
+          echo "最新Passwall版本（规范化）: $LATEST_VER"
+          echo "LATEST_VER=$LATEST_VER" >> $GITHUB_ENV
+
+          # ---------- x86 版本检查 ----------
+          # 列出所有 passwall_x86_64 前缀的 .run 文件，按版本排序取最新
+          # 版本对比仅使用 .run 文件名，不读取文件内容
+          X86_LATEST_FILE=$(find run/x86 -maxdepth 1 -name 'passwall_x86_64_*.run' -type f 2>/dev/null \
+            | sort -V | tail -n 1)
+
+          if [ -z "$X86_LATEST_FILE" ]; then
+            echo "[x86]找不到现有的构建，需要构建。"
+            NEED_BUILD="true"
+          else
+            X86_EXISTING_VER=$(basename "$X86_LATEST_FILE" \
+              | sed -n 's/^passwall_x86_64_\(.*\)\.run$/\1/p')
+            echo "[x86]现有版本: $X86_EXISTING_VER  (文件: $(basename "$X86_LATEST_FILE"))"
+
+            if [ "$X86_EXISTING_VER" != "$LATEST_VER" ]; then
+              echo "[x86]版本不匹配($X86_EXISTING_VER vs $LATEST_VER)，将重建。"
+              NEED_BUILD="true"
+            else
+              echo "[x86]已经是最新版本，无需更新。"
+            fi
+          fi
+
+          # ---------- arm64 版本检查 ----------
+          ARM64_LATEST_FILE=$(find run/arm64 -maxdepth 1 -name 'passwall_aarch64_*.run' -type f 2>/dev/null \
+            | sort -V | tail -n 1)
+
+          if [ -z "$ARM64_LATEST_FILE" ]; then
+            echo "[arm64]找不到现有的构建，需要构建。"
+            NEED_BUILD="true"
+          else
+            ARM64_EXISTING_VER=$(basename "$ARM64_LATEST_FILE" \
+              | sed -n 's/^passwall_aarch64_\(.*\)\.run$/\1/p')
+            echo "[arm64]现有版本: $ARM64_EXISTING_VER  (文件: $(basename "$ARM64_LATEST_FILE"))"
+
+            if [ "$ARM64_EXISTING_VER" != "$LATEST_VER" ]; then
+              echo "[arm64]版本不匹配($ARM64_EXISTING_VER vs $LATEST_VER)，将重建。"
+              NEED_BUILD="true"
+            else
+              echo "[arm64]已经是最新版本，无需更新。"
+            fi
+          fi
+
+          if [ "$NEED_BUILD" = "false" ]; then
+            echo "=== x86和arm64都已处于 $LATEST_VER 版本，跳过整个构建 ==="
+          else
+            echo "=== 需要构建 ==="
+          fi
+
+          echo "NEED_BUILD=$NEED_BUILD" >> $GITHUB_ENV
+
+      - name: 克隆 makeself 工具仓库
+        if: env.NEED_BUILD == 'true'
+        run: git clone https://github.com/megastep/makeself.git
+
+      - name: 下载最新 Passwall 安装包
+        if: env.NEED_BUILD == 'true'
+        run: |
+          mkdir -p downloads
+          cd downloads
+          # 下载依赖ipk
+          curl -L -o passwall_packages_ipk_x86_64.zip https://github.com/wztx/openwrt_store/releases/download/passwall/passwall_packages_ipk_x86_64.zip
+          curl -L -o passwall_packages_ipk_aarch64.zip https://github.com/wztx/openwrt_store/releases/download/passwall/passwall_packages_ipk_aarch64.zip
+          # 下载主程序luci（注意：匹配的是 openwrt-passwall，不是 passwall2）
+          # 统一使用 jq 解析资产地址，并保存为固定文件名，避免依赖资产命名前缀
+          LUCI_APP_URL=$(curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
+            | jq -r '.assets[] |
+               select(.name | test("^23\\.05-24\\.10_luci-app-passwall_.*_all\\.ipk$")) |
+               .browser_download_url')
+          if [ -z "$LUCI_APP_URL" ] || [ "$LUCI_APP_URL" = "null" ]; then
+              echo "未找到luci-app-passwall资产，终止构建。"
+              exit 1
+          fi
+          curl -L -o luci-app-passwall_all.ipk "$LUCI_APP_URL"
+          # 下载简体中文语言包
+          LUCI_I18N_URL=$(curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
+            | jq -r '.assets[] |
+               select(.name | test("^23\\.05-24\\.10_luci-i18n-passwall-zh-cn_.*\\.ipk$")) |
+               .browser_download_url')
+          if [ -z "$LUCI_I18N_URL" ] || [ "$LUCI_I18N_URL" = "null" ]; then
+              echo "未找到简体中文语言包资产，终止构建。"
+              exit 1
+          fi
+          curl -L -o luci-i18n-passwall-zh-cn_all.ipk "$LUCI_I18N_URL"
+
+      - name: 清理 x86_64 软件包文件名中的特殊字符
+        if: env.NEED_BUILD == 'true'
+        run: |
+          mkdir -p passwall_x86_64/depends passwall_x86_64/main
+          unzip downloads/passwall_packages_ipk_x86_64.zip -d passwall_x86_64/depends
+          rm downloads/passwall_packages_ipk_x86_64.zip
+          # 主程序与语言包使用下载时保存的固定文件名
+          cp downloads/luci-app-passwall_all.ipk downloads/luci-i18n-passwall-zh-cn_all.ipk passwall_x86_64/main/
+
+      - name: 清理 aarch64(arm64) 软件包文件名中的特殊字符
+        if: env.NEED_BUILD == 'true'
+        run: |
+          mkdir -p passwall_aarch64/depends passwall_aarch64/main
+          unzip downloads/passwall_packages_ipk_aarch64.zip -d passwall_aarch64/depends
+          rm downloads/passwall_packages_ipk_aarch64.zip
+          # 主程序与语言包使用下载时保存的固定文件名
+          cp downloads/luci-app-passwall_all.ipk downloads/luci-i18n-passwall-zh-cn_all.ipk passwall_aarch64/main/
+
+      - name: 生成安装脚本 install.sh
+        if: env.NEED_BUILD == 'true'
+        run: |
+          cat <<EOF > passwall_x86_64/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "更新失败。"
+              exit 1
+          fi
+          opkg install iptables-mod-tproxy
+          opkg install iptables-mod-socket
+          opkg install iptables-mod-iprange
+          opkg install iptables-mod-conntrack-extra
+          opkg install depends/*.ipk
+          opkg install main/*.ipk
+          EOF
+          chmod +x passwall_x86_64/install.sh
+          cp passwall_x86_64/install.sh passwall_aarch64/install.sh
+
+      - name: 移动新安装包到目标目录
+        if: env.NEED_BUILD == 'true'
+        run: |
+          mv passwall_x86_64 makeself/
+          mv passwall_aarch64 makeself/
+
+      - name: 生成 .run 自解压安装包
+        if: env.NEED_BUILD == 'true'
+        run: |
+          cd makeself
+          ./makeself.sh passwall_x86_64/ passwall_x86_64_${{ env.LATEST_VER }}.run "by github action" ./install.sh
+          ./makeself.sh passwall_aarch64/ passwall_aarch64_${{ env.LATEST_VER }}.run "by github action" ./install.sh
+
+      - name: 检查文件大小
+        if: env.NEED_BUILD == 'true'
+        run: |
+          ls -lh makeself/passwall_*.run
+
+      - name: 删除旧的构建文件并将新版本上传到存储库
+        if: env.NEED_BUILD == 'true'
+        run: |
+          # 确保目标目录存在
+          mkdir -p run/x86 run/arm64
+
+          # 只删除与本构建相关的旧版本 .run 文件，保留目录中的其它文件
+          echo "正在清理旧的构建文件..."
+          rm -f run/x86/passwall_x86_64_*.run
+          rm -f run/arm64/passwall_aarch64_*.run
+
+          # 复制新版本到对应目录
+          echo "复制新的构建文件..."
+          cp makeself/passwall_x86_64_${{ env.LATEST_VER }}.run run/x86/
+          cp makeself/passwall_aarch64_${{ env.LATEST_VER }}.run run/arm64/
+
+          echo "检查文件 run/x86:"
+          ls -lh run/x86/
+          echo "检查文件 run/arm64:"
+          ls -lh run/arm64/
+
+      - name: 提交更新到仓库
+        if: env.NEED_BUILD == 'true'
+        run: |
+          BUILD_TIME=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M:%S')
+          git add run/x86/ run/arm64/
+          # 防御无变更时不至于提交失败
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变更。"
+          else
+            git commit -m "自动构建 Passwall ${{ env.LATEST_TAG }} - ${BUILD_TIME} (北京时间)"
+            git push
+          fi
+
+      - name: 删除构建缓存
+        if: always()
+        run: |
+          echo "清理生成缓存和临时文件..."
+          rm -rf downloads makeself passwall_* release_notes.md
+          echo "缓存已清理。"
+
+      - name: 跳过构建（已是最新版本）
+        if: env.NEED_BUILD == 'false'
+        run: |
+          echo "Passwall版本${{ env.LATEST_TAG }}已经是最新版本，无需更新。"
+          echo "跳过构建和上传。"

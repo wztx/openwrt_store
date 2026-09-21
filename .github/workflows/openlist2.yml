@@ -1,0 +1,181 @@
+#=================================================
+# https://github.com/wztx/openwrt_store/
+# 描述：使用 GitHub Actions 构建 OpenList2 自解压安装包
+#       版本对比通过后直接提交到本仓库 run/ 目录，并清理本构建的旧版本
+# 许可证：MIT
+# 作者：wztx
+# 博客：lpfcdn.com
+#=================================================
+
+name: OpenList2 Openwrt24版本
+
+on:
+  schedule:
+    - cron: "15 22 * * *"  # 北京时间每天早上 6 点 15 分
+  workflow_dispatch:       # 允许手动触发
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: openlist2-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建Openlist2并提交到本仓库
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: 检出本仓库代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: 获取上游最新版本号
+        id: fetch_latest_tag
+        run: |
+          set -e
+          latest_tag=$(curl -s https://api.github.com/repos/sbwml/luci-app-openlist2/releases/latest | jq -r '.tag_name')
+          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
+            echo "::error::获取上游版本号失败，终止构建。"
+            exit 1
+          fi
+          echo "LATEST_TAG=$latest_tag" >> "$GITHUB_ENV"
+          echo "上游最新版本：$latest_tag"
+
+      - name: 与本仓库已有文件进行版本对比
+        id: version_check
+        run: |
+          set -e
+          # 版本对比条件：仅以生成的 .run 文件名进行对比，不读取文件内容
+          x86_file="run/x86/openlist2_${LATEST_TAG}_x86_64.run"
+          arm_file="run/arm64/openlist2_${LATEST_TAG}_aarch64_cortex-a53.run"
+          echo "x86_64 目标文件：$x86_file"
+          echo "aarch64 目标文件：$arm_file"
+          if [ -f "$x86_file" ] && [ -f "$arm_file" ]; then
+            echo "::notice::本仓库已存在相同版本的 .run 文件，无需更新，跳过构建。"
+            echo "NEED_BUILD=false" >> "$GITHUB_ENV"
+          else
+            echo "检测到新版本（或某一架构缺失），需要构建。"
+            echo "NEED_BUILD=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: 克隆 makeself 工具仓库
+        if: env.NEED_BUILD == 'true'
+        run: git clone --depth 1 https://github.com/megastep/makeself.git
+
+      - name: 下载上游最新安装包
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          cd makeself
+          # 下载最新 release 的两个架构包
+          curl -LO "$(curl -s https://api.github.com/repos/sbwml/luci-app-openlist2/releases/latest | grep -oP '"browser_download_url":\s*".*openwrt-24.10-aarch64_cortex-a53.tar.gz"' | cut -d '"' -f 4)"
+          curl -LO "$(curl -s https://api.github.com/repos/sbwml/luci-app-openlist2/releases/latest | grep -oP '"browser_download_url":\s*".*openwrt-24.10-x86_64.tar.gz"' | cut -d '"' -f 4)"
+          # 解压并分别重命名 packages_ci 目录
+          tar -xvzf ./*aarch64_cortex-a53.tar.gz
+          mv packages_ci openlist2_aarch64_cortex-a53
+          tar -xvzf ./*x86_64.tar.gz
+          mv packages_ci openlist2_x86_64
+
+      - name: 清理软件包文件名中的特殊字符
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          cd makeself
+          for dir in openlist2_x86_64 openlist2_aarch64_cortex-a53; do
+            pushd "$dir" >/dev/null
+            for file in *~*.ipk; do
+              [ -e "$file" ] || continue
+              # 构造新文件名，去除 ~ 字符
+              new_file="$(echo "$file" | tr -d '~')"
+              # 如果目标文件名已存在，则提示并跳过
+              if [ -e "$new_file" ]; then
+                echo "目标文件已存在，跳过：$new_file"
+                continue
+              fi
+              mv "$file" "$new_file"
+              echo "已重命名：$file -> $new_file"
+            done
+            popd >/dev/null
+          done
+
+      - name: 生成安装脚本 install.sh
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          # 使用引号包裹的 EOF，避免脚本中的 $? 等符号在生成时被展开
+          cat <<'OUTER_EOF' > makeself/openlist2_x86_64/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "软件源更新失败。"
+              exit 1
+          fi
+          opkg install ./*.ipk
+          OUTER_EOF
+          chmod +x makeself/openlist2_x86_64/install.sh
+          cp makeself/openlist2_x86_64/install.sh makeself/openlist2_aarch64_cortex-a53/install.sh
+
+      - name: 生成 .run 自解压安装包
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          cd makeself
+          ./makeself.sh openlist2_x86_64/ "openlist2_${LATEST_TAG}_x86_64.run" "OpenList2 x86_64 自解压安装包" ./install.sh
+          ./makeself.sh openlist2_aarch64_cortex-a53/ "openlist2_${LATEST_TAG}_aarch64_cortex-a53.run" "OpenList2 aarch64_cortex-a53 自解压安装包" ./install.sh
+          ls -lh ./*.run
+
+      - name: 仅删除本构建相关的旧版本文件
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          mkdir -p run/x86 run/arm64
+          new_x86="openlist2_${LATEST_TAG}_x86_64.run"
+          new_arm="openlist2_${LATEST_TAG}_aarch64_cortex-a53.run"
+          # 仅删除与本构建同命名规则（openlist2_*_x86_64.run）且版本不同的旧文件
+          find run/x86 -maxdepth 1 -type f -name 'openlist2_*_x86_64.run' ! -name "$new_x86" -print -delete
+          # 仅删除与本构建同命名规则（openlist2_*_aarch64_cortex-a53.run）且版本不同的旧文件
+          find run/arm64 -maxdepth 1 -type f -name 'openlist2_*_aarch64_cortex-a53.run' ! -name "$new_arm" -print -delete
+
+      - name: 移动新安装包到目标目录
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          mv -f "makeself/openlist2_${LATEST_TAG}_x86_64.run" run/x86/
+          mv -f "makeself/openlist2_${LATEST_TAG}_aarch64_cortex-a53.run" run/arm64/
+
+      - name: 提交并推送至本仓库
+        if: env.NEED_BUILD == 'true'
+        run: |
+          set -e
+          # 提交信息自动携带版本号和北京时间
+          build_time=$(date -u -d '+8 hour' +'%Y-%m-%d %H:%M')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A run/
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变更。"
+          else
+            git commit -m "自动构建 OpenList2 ${LATEST_TAG} - ${build_time}（北京时间）"
+            git push
+          fi
+
+      - name: 清理运行缓存与临时文件
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 删除工作区中的临时构建文件（不影响已提交的 run/ 目录）
+          rm -rf makeself ./*.tar.gz 2>/dev/null || true
+          # 尽力清理本仓库的 Actions 运行缓存，失败不影响构建结果
+          if command -v gh >/dev/null 2>&1; then
+            for cache_key in $(gh cache list --repo "$GITHUB_REPOSITORY" --json key --jq '.[].key' 2>/dev/null || true); do
+              echo "删除运行缓存：$cache_key"
+              gh cache delete "$cache_key" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+            done
+          fi
+          echo "缓存清理完成。"

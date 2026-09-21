@@ -1,0 +1,186 @@
+# ============================================================
+# Hysteria OpenWrt IPK 自动构建工作流
+# 功能：自动从 HyNetworks/hysteria 官方 releases 拉取最新版本，
+#       打包为 OpenWrt 可用的 .ipk 安装包，自动对比版本、提交更新。
+# 触发方式：
+#   1. 定时触发（每天6点30分）
+#   2. 手动触发（workflow_dispatch）
+# 输出路径：
+#   - x86_64 架构：run/x86/hysteria/
+#   - aarch64 架构：run/arm64/hysteria/
+# 设计原则：
+#   - 以.ipk文件名作为版本对比依据，已有对应版本则跳过
+#   - 仅删除hysteria旧版本ipk，绝不影响仓库中其他文件
+#   - 仅生成.ipk文件，不产生任何冗余文件
+#   - 提交信息自动携带版本号和构建时间
+#   - 构建完成自动清理临时缓存
+# ============================================================
+
+name: Hysteria IPK 安装包
+
+on:
+  schedule:
+    - cron: "30 22 * * *"  # 北京时间早上 6 点 30
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: hysteria-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建并上传 Hysteria IPK
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出当前仓库代码
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 获取 Hysteria 最新版本号
+        id: get_version
+        run: |
+          set -e
+          LATEST_TAG=$(curl -fsSL --retry 3 "https://api.github.com/repos/HyNetworks/hysteria/releases/latest" | jq -r '.tag_name')
+          VERSION="${LATEST_TAG#app/}"
+          echo "检测到 Hysteria 最新版本: v${VERSION}"
+          echo "tag_name=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$GITHUB_OUTPUT"
+
+      - name: 对比版本判断是否需要构建
+        id: check
+        run: |
+          set -e
+          VERSION="${{ steps.get_version.outputs.version }}"
+          X86_NAME="hysteria_${VERSION}-1_x86_64.ipk"
+          ARM64_NAME="hysteria_${VERSION}-1_aarch64_generic.ipk"
+          echo "预期生成文件:"
+          echo "  x86_64: ${X86_NAME}"
+          echo "  aarch64: ${ARM64_NAME}"
+          mkdir -p run/x86/hysteria run/arm64/hysteria
+          NEED_BUILD="false"
+          if [ -f "run/x86/hysteria/${X86_NAME}" ]; then
+            echo "✅ x86_64 v${VERSION} 已存在"
+          else
+            echo "🔍 x86_64 v${VERSION} 不存在，需要构建"
+            NEED_BUILD="true"
+          fi
+          if [ -f "run/arm64/hysteria/${ARM64_NAME}" ]; then
+            echo "✅ aarch64 v${VERSION} 已存在"
+          else
+            echo "🔍 aarch64 v${VERSION} 不存在，需要构建"
+            NEED_BUILD="true"
+          fi
+          echo "x86_name=${X86_NAME}" >> "$GITHUB_OUTPUT"
+          echo "arm64_name=${ARM64_NAME}" >> "$GITHUB_OUTPUT"
+          echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
+          if [ "${NEED_BUILD}" = "false" ]; then
+            echo "========================================="
+            echo "✅ 两个架构均已是最新版本，跳过构建"
+            echo "========================================="
+          else
+            echo "========================================="
+            echo "🔨 发现新版本，开始构建流程"
+            echo "========================================="
+          fi
+
+      - name: 构建 x86_64 架构 IPK
+        if: steps.check.outputs.need_build == 'true'
+        env:
+          VER: ${{ steps.get_version.outputs.version }}
+          TAG: ${{ steps.get_version.outputs.tag_name }}
+          IPK: ${{ steps.check.outputs.x86_name }}
+          ARCHITECTURE: x86_64
+          BINARY_NAME: hysteria-linux-amd64
+          TARGET_DIR: run/x86/hysteria
+          FILE_GLOB: "hysteria_*_x86_64.ipk"
+        run: bash scripts/hysteria-build-ipk.sh
+
+      - name: 构建 aarch64 架构 IPK
+        if: steps.check.outputs.need_build == 'true'
+        env:
+          VER: ${{ steps.get_version.outputs.version }}
+          TAG: ${{ steps.get_version.outputs.tag_name }}
+          IPK: ${{ steps.check.outputs.arm64_name }}
+          ARCHITECTURE: aarch64_generic
+          BINARY_NAME: hysteria-linux-arm64
+          TARGET_DIR: run/arm64/hysteria
+          FILE_GLOB: "hysteria_*_aarch64_generic.ipk"
+        run: bash scripts/hysteria-build-ipk.sh
+
+      - name: 验证 IPK 文件完整性
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          set -e
+          VER="${{ steps.get_version.outputs.version }}"
+          X86_FILE="${GITHUB_WORKSPACE}/run/x86/hysteria/hysteria_${VER}-1_x86_64.ipk"
+          ARM64_FILE="${GITHUB_WORKSPACE}/run/arm64/hysteria/hysteria_${VER}-1_aarch64_generic.ipk"
+          echo "===== IPK 完整性校验 ====="
+          for f in "$X86_FILE" "$ARM64_FILE"; do
+            echo ""
+            echo "校验: $f"
+            test -f "$f" || { echo "❌ 文件缺失: $f"; exit 1; }
+            echo "✅ 文件存在: $(du -h "$f" | cut -f1)"
+            for comp in debian-binary control.tar.gz data.tar.gz; do
+              ar t "$f" | grep -qx "$comp" || { echo "❌ 缺少组件: $comp"; exit 1; }
+              echo "  ✅ $comp 存在"
+            done
+            TMPD=$(mktemp -d)
+            # 使用 pushd/popd 确保工作目录不漂移，或直接用 -C 解压到指定目录
+            tar -xzf "$f" -C "$TMPD" 2>/dev/null || {
+              # ar归档需用ar解包，直接在TMPD里用绝对路径操作，不cd
+              ( cd "$TMPD" && ar x "$f" )
+            }
+            test "$(cat "$TMPD/debian-binary")" = "2.0" || { echo "❌ debian-binary版本错误"; rm -rf "$TMPD"; exit 1; }
+            echo "  ✅ debian-binary 版本正确(2.0)"
+            tar -xzf "$TMPD/control.tar.gz" -C "$TMPD" control
+            echo "  control元数据:"
+            sed 's/^/    /' "$TMPD/control"
+            rm -rf "$TMPD"
+          done
+          echo ""
+          echo "===== ✅ 所有IPK文件校验通过 ====="
+
+      - name: 提交更新到仓库
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          set -e
+          VER="${{ steps.get_version.outputs.version }}"
+          BUILD_TIME="${{ steps.get_version.outputs.build_time }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add run/x86/hysteria/ run/arm64/hysteria/
+          if git diff --cached --quiet; then
+            echo "ℹ️  无文件变更，跳过提交"
+          else
+            COMMIT_MSG="🔖 自动更新 Hysteria IPK 至 v${VER} | 构建时间: ${BUILD_TIME}"
+            echo "提交: ${COMMIT_MSG}"
+            git commit -m "${COMMIT_MSG}"
+            git push
+            echo "✅ 已推送至仓库"
+          fi
+
+      - name: 版本已是最新
+        if: steps.check.outputs.need_build != 'true'
+        run: |
+          echo "=============================================="
+          echo "✅ 本地已是最新版本 v${{ steps.get_version.outputs.version }}"
+          echo "⏭️  本次无需构建和提交"
+          echo "=============================================="
+
+      - name: 清理运行缓存
+        if: always()
+        run: |
+          echo "🧹 清理运行缓存..."
+          rm -rf /tmp/tmp.* /tmp/hysteria-* 2>/dev/null || true
+          git gc --prune=now --quiet 2>/dev/null || true
+          echo "✅ 缓存清理完成"

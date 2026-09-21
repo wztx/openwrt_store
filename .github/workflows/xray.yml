@@ -1,0 +1,163 @@
+#=================================================
+# https://github.com/wztx/openwrt_store/
+# Description: Build RunFiles using GitHub Actions
+# Lisence: MIT
+# Author: wztx
+# Blog: lpfcdn.com
+#=================================================
+
+# 用户可利用此run单独升级最新版xray-core内核
+name: xray Openwrt24-25版本
+
+on:
+  schedule:
+    - cron: "3 22 * * *"  # 北京时间早上 6 点 03
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: xray-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建xray并提交到本仓库
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: 拉取存储库（获取完整历史记录）
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # 拉取完整历史以便对比文件
+      
+      - name: 配置 git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 从上游获取最新发布标签
+        id: fetch_latest_tag
+        run: |
+          latest_tag=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases \
+          | jq -r 'sort_by(.published_at) | reverse | map(select(.prerelease==true)) | .[0].tag_name')
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+          echo "最新版本:$latest_tag"
+          
+          # 获取当前时间用于提交信息
+          BUILD_TIME=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M:%S')
+          echo "BUILD_TIME=$BUILD_TIME" >> $GITHUB_ENV
+
+      - name: 检查现有版本，如果没有更新则跳过
+        id: check_version
+        run: |
+          # 创建目标目录
+          mkdir -p run/x86 run/arm64
+          
+          # 检查是否已有相同版本的文件
+          if [ -f "run/x86/xray-core_${LATEST_TAG}_x86_64.run" ] && [ -f "run/arm64/xray-core_${LATEST_TAG}_aarch64_a53.run" ]; then
+            echo "当前版本 ${LATEST_TAG} 已存在，无需更新"
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "需要构建新版本 ${LATEST_TAG}"
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+            
+            # 删除旧版本文件（仅删除与本次构建相关的xray-core run文件，不删除其他文件）
+            find run/x86 -maxdepth 1 -type f -name "xray-core_*.run" -delete
+            find run/arm64 -maxdepth 1 -type f -name "xray-core_*.run" -delete
+          fi
+
+      - name: 克隆存储库
+        if: env.SKIP_BUILD == 'false'
+        run: git clone https://github.com/megastep/makeself.git
+
+      - name: 下载最新xray-core文件
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          mkdir -p x86 x86-pre arm64 arm64-pre
+
+          # 下载xray-core x86
+          wget -O x86-pre/Xray-linux-64.zip https://github.com/XTLS/Xray-core/releases/download/${LATEST_TAG}/Xray-linux-64.zip
+          unzip -o -q x86-pre/Xray-linux-64.zip -d x86-pre
+          cp -f x86-pre/xray x86/xray
+          
+          # 下载xray-core arm64
+          wget -O arm64-pre/Xray-linux-arm64-v8a.zip  https://github.com/XTLS/Xray-core/releases/download/${LATEST_TAG}/Xray-linux-arm64-v8a.zip
+          unzip -o -q arm64-pre/Xray-linux-arm64-v8a.zip -d arm64-pre
+          cp -f arm64-pre/xray arm64/xray
+
+
+      - name: 创建install.sh脚本
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          cat <<EOF > x86/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "update failed。"
+              exit 1
+          fi
+          opkg install xray-core
+          chmod +x xray
+          cp xray /usr/bin/xray
+          echo "Xray core has been updated to ${LATEST_TAG}"
+          EOF
+          chmod +x x86/install.sh
+          cp x86/install.sh arm64/install.sh
+
+      - name: 将xray-core目录移至makeelf
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          mv x86 makeself/
+          mv arm64 makeself/
+
+      - name: 创建自解压包
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          cd makeself
+          ./makeself.sh x86/ xray-core_${LATEST_TAG}_x86_64.run "by github action" ./install.sh
+          ./makeself.sh arm64/ xray-core_${LATEST_TAG}_aarch64_a53.run "by github action" ./install.sh
+
+      - name: 检查文件大小
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          ls -lh makeself/xray-core_*.run
+
+      - name: 将生成的文件移动到目标目录
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          # 将生成的run文件移动到对应目录
+          mv makeself/xray-core_${LATEST_TAG}_x86_64.run run/x86/
+          mv makeself/xray-core_${LATEST_TAG}_aarch64_a53.run run/arm64/
+          
+          # 验证文件
+          ls -lh run/x86/
+          ls -lh run/arm64/
+
+      - name: 提交更新并推送更新到仓库
+        if: env.SKIP_BUILD == 'false'
+        run: |
+          git add run/
+          git commit -m "🔖 更新 Xray Core 至 ${LATEST_TAG} | 构建时间: ${BUILD_TIME}"
+          git push
+
+      - name: 清理构建缓存
+        if: always()
+        run: |
+          echo "清理运行缓存..."
+          rm -rf makeself x86 x86-pre arm64 arm64-pre
+          echo "缓存清理完成"
+          
+      - name: 构建汇总
+        run: |
+          if [ "$SKIP_BUILD" = "true" ]; then
+            echo "✅ 版本检查完成: 已有最新版本 ${LATEST_TAG}，跳过构建"
+          else
+            echo "✅ 构建完成: Xray Core ${LATEST_TAG} 已上传至仓库对应目录"
+            echo "   - x86版本: run/x86/xray-core_${LATEST_TAG}_x86_64.run"
+            echo "   - arm64版本: run/arm64/xray-core_${LATEST_TAG}_aarch64_a53.run"
+            echo "   - 提交时间: ${BUILD_TIME}"
+          fi
