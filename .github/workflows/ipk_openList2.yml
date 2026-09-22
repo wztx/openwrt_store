@@ -1,0 +1,463 @@
+# ==============================================
+# 同步 luci-app-openlist2 插件到本仓库
+# OpenWrt 版本: 24.10
+# 上游仓库: sbwml/luci-app-openlist2
+# 触发: 每日定时 + 手动触发(支持强制更新)
+# ==============================================
+name: 自动更新 OpenList2 IPK 软件包
+
+on:
+  # 每日北京时间 06:15 (UTC 22:15) 定时检查
+  schedule:
+    - cron: '15 22 * * *'
+  
+  # 手动触发，支持强制更新参数
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        required: false
+        type: boolean
+        default: false
+
+# 并发限制：同一时间只运行一个，避免冲突
+concurrency:
+  group: sync-openlist2-${{ github.ref }}
+  cancel-in-progress: false
+
+# 工作权限
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: 同步OpenList2插件
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: 初始化工作环境
+        id: init
+        run: |
+          # 设置临时目录
+          echo "temp_dir=${{ runner.temp }}/openlist2_sync" >> $GITHUB_OUTPUT
+          mkdir -p "${{ runner.temp }}/openlist2_sync"
+          
+          # 设置目标目录
+          echo "x86_dir=run/x86_64/luci-app-openlist2" >> $GITHUB_OUTPUT
+          echo "aarch64_dir=run/aarch64/luci-app-openlist2" >> $GITHUB_OUTPUT
+          
+          # 创建目标目录
+          mkdir -p "run/x86_64/luci-app-openlist2"
+          mkdir -p "run/aarch64/luci-app-openlist2"
+          
+          echo "✓ 工作环境初始化完成"
+      
+      - name: 获取上游最新版本信息
+        id: get_version
+        run: |
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          
+          echo "正在获取上游release列表..."
+          # 获取所有release，按发布时间降序排列，第一个就是最新版（包含预发布版）
+          HTTP_CODE=$(curl -w "%{http_code}" -s -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: GitHub-Actions-Sync-Bot" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/sbwml/luci-app-openlist2/releases?per_page=10" \
+            -o "${TEMP_DIR}/releases.json")
+          
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "✗ 获取release列表失败，HTTP状态码: ${HTTP_CODE}"
+            exit 1
+          fi
+          
+          # 提取第一个release（最新的，不管是否是预发布版）
+          TAG_NAME=$(jq -r '.[0].tag_name' "${TEMP_DIR}/releases.json")
+          RELEASE_NAME=$(jq -r '.[0].name' "${TEMP_DIR}/releases.json")
+          PUBLISHED_AT=$(jq -r '.[0].published_at' "${TEMP_DIR}/releases.json")
+          IS_PRERELEASE=$(jq -r '.[0].prerelease' "${TEMP_DIR}/releases.json")
+          
+          echo "✓ 最新版本标签: ${TAG_NAME}"
+          echo "✓ 发布名称: ${RELEASE_NAME}"
+          echo "✓ 发布时间: ${PUBLISHED_AT}"
+          echo "✓ 是否预发布: ${IS_PRERELEASE}"
+          
+          if [ -z "${TAG_NAME}" ] || [ "${TAG_NAME}" = "null" ]; then
+            echo "✗ 未能获取到有效版本标签"
+            exit 1
+          fi
+          
+          # 获取该release的所有资产，精确匹配目标架构文件
+          jq -r '.[0].assets[] | select(.name | test("openwrt-24\\.10-(aarch64_generic|x86_64)")) | .browser_download_url' "${TEMP_DIR}/releases.json" > "${TEMP_DIR}/download_urls.txt"
+          
+          echo "找到的下载链接:"
+          cat "${TEMP_DIR}/download_urls.txt"
+          
+          # 验证是否找到了两个架构的文件
+          x86_count=$(grep -c "x86_64" "${TEMP_DIR}/download_urls.txt" || echo 0)
+          aarch64_count=$(grep -c "aarch64_generic" "${TEMP_DIR}/download_urls.txt" || echo 0)
+          echo "x86_64文件数: ${x86_count}, aarch64_generic文件数: ${aarch64_count}"
+          
+          if [ "${x86_count}" -eq 0 ] || [ "${aarch64_count}" -eq 0 ]; then
+            echo "⚠ 警告：未能找到全部两个架构的文件，可能上游发布结构有变化"
+          fi
+          
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "release_name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "is_prerelease=${IS_PRERELEASE}" >> $GITHUB_OUTPUT
+      
+      - name: 检查本地文件是否已存在
+        id: check_files
+        run: |
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          FORCE_UPDATE="${{ inputs.force_update || 'false' }}"
+          
+          echo "强制更新参数: ${FORCE_UPDATE}"
+          
+          if [ "${FORCE_UPDATE}" = "true" ]; then
+            echo "已启用强制更新，跳过文件存在检查"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 提取需要下载的文件名
+          > "${TEMP_DIR}/expected_files.txt"
+          
+          while read -r url; do
+            filename=$(basename "${url}")
+            echo "${filename}" >> "${TEMP_DIR}/expected_files.txt"
+          done < "${TEMP_DIR}/download_urls.txt"
+          
+          echo "期望的文件列表:"
+          cat "${TEMP_DIR}/expected_files.txt"
+          
+          # 分别检查两个目录中的文件
+          all_exist=true
+          
+          while read -r filename; do
+            if echo "${filename}" | grep -q "x86_64"; then
+              target_path="${X86_DIR}/${filename}"
+            elif echo "${filename}" | grep -q "aarch64_generic"; then
+              target_path="${AARCH64_DIR}/${filename}"
+            else
+              echo "⚠ 未知架构文件: ${filename}，跳过检查"
+              continue
+            fi
+            
+            # 检查文件是否存在且非空
+            if [ -f "${target_path}" ] && [ -s "${target_path}" ]; then
+              echo "✓ 文件已存在: ${target_path}"
+            else
+              echo "✗ 文件缺失或为空: ${target_path}"
+              all_exist=false
+            fi
+          done < "${TEMP_DIR}/expected_files.txt"
+          
+          if [ "${all_exist}" = "true" ]; then
+            echo "✓ 所有文件已存在，无需更新"
+            echo "need_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "→ 存在缺失文件，需要进行更新"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 下载新版本文件
+        if: steps.check_files.outputs.need_update == 'true'
+        id: download
+        run: |
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          
+          # 创建下载临时目录
+          DOWNLOAD_DIR="${TEMP_DIR}/downloads"
+          mkdir -p "${DOWNLOAD_DIR}/x86_64" "${DOWNLOAD_DIR}/aarch64_generic"
+          
+          # 下载所有文件
+          while read -r url; do
+            filename=$(basename "${url}")
+            echo "正在下载: ${filename}"
+            
+            HTTP_CODE=$(curl -w "%{http_code}" -s -L \
+              -H "User-Agent: GitHub-Actions-Sync-Bot" \
+              -o "${DOWNLOAD_DIR}/${filename}" \
+              "${url}")
+            
+            if [ "${HTTP_CODE}" != "200" ]; then
+              echo "✗ 下载失败: ${filename}, HTTP状态码: ${HTTP_CODE}"
+              exit 1
+            fi
+            
+            # 验证文件大小
+            FILE_SIZE=$(stat -c%s "${DOWNLOAD_DIR}/${filename}" 2>/dev/null || echo 0)
+            if [ "${FILE_SIZE}" -lt 1000 ]; then
+              echo "✗ 文件大小异常: ${filename}, 大小: ${FILE_SIZE} 字节"
+              exit 1
+            fi
+            
+            echo "✓ 下载完成: ${filename} (${FILE_SIZE} 字节)"
+          done < "${TEMP_DIR}/download_urls.txt"
+          
+          echo "✓ 所有文件下载完成"
+      
+      - name: 提取IPK文件
+        if: steps.check_files.outputs.need_update == 'true'
+        id: extract
+        run: |
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          DOWNLOAD_DIR="${TEMP_DIR}/downloads"
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          
+          EXTRACT_DIR="${TEMP_DIR}/extracted"
+          mkdir -p "${EXTRACT_DIR}/x86_64" "${EXTRACT_DIR}/aarch64_generic"
+          
+          # 处理x86_64文件
+          for archive in "${DOWNLOAD_DIR}"/*x86_64*; do
+            if [ -f "${archive}" ]; then
+              echo "正在提取x86_64: $(basename "${archive}")"
+              
+              # 根据文件类型选择解压方式
+              if echo "${archive}" | grep -qE "\.tar\.gz$|\.tgz$"; then
+                tar -xzf "${archive}" -C "${EXTRACT_DIR}/x86_64/"
+              elif echo "${archive}" | grep -qE "\.tar\.xz$|\.txz$"; then
+                tar -xJf "${archive}" -C "${EXTRACT_DIR}/x86_64/"
+              elif echo "${archive}" | grep -qE "\.tar\.zst$|\.tar\.zstd$"; then
+                tar --zstd -xf "${archive}" -C "${EXTRACT_DIR}/x86_64/"
+              elif echo "${archive}" | grep -qE "\.zip$"; then
+                unzip -o "${archive}" -d "${EXTRACT_DIR}/x86_64/"
+              else
+                echo "⚠ 未知压缩格式，尝试用tar自动识别: $(basename "${archive}")"
+                tar -xf "${archive}" -C "${EXTRACT_DIR}/x86_64/"
+              fi
+            fi
+          done
+          
+          # 处理aarch64_generic文件
+          for archive in "${DOWNLOAD_DIR}"/*aarch64_generic*; do
+            if [ -f "${archive}" ]; then
+              echo "正在提取aarch64_generic: $(basename "${archive}")"
+              
+              if echo "${archive}" | grep -qE "\.tar\.gz$|\.tgz$"; then
+                tar -xzf "${archive}" -C "${EXTRACT_DIR}/aarch64_generic/"
+              elif echo "${archive}" | grep -qE "\.tar\.xz$|\.txz$"; then
+                tar -xJf "${archive}" -C "${EXTRACT_DIR}/aarch64_generic/"
+              elif echo "${archive}" | grep -qE "\.tar\.zst$|\.tar\.zstd$"; then
+                tar --zstd -xf "${archive}" -C "${EXTRACT_DIR}/aarch64_generic/"
+              elif echo "${archive}" | grep -qE "\.zip$"; then
+                unzip -o "${archive}" -d "${EXTRACT_DIR}/aarch64_generic/"
+              else
+                echo "⚠ 未知压缩格式，尝试用tar自动识别: $(basename "${archive}")"
+                tar -xf "${archive}" -C "${EXTRACT_DIR}/aarch64_generic/"
+              fi
+            fi
+          done
+          
+          # 查找所有IPK文件并移动到目标目录（安全模式，防止路径遍历）
+          echo "正在查找并移动IPK文件..."
+          
+          # 安全复制函数：只取basename防止路径遍历
+          safe_copy_ipk() {
+            local src_ipk="$1"
+            local dest_dir="$2"
+            local arch_name="$3"
+            
+            # 只取文件名，丢弃所有路径信息，防止目录遍历污染
+            local ipk_name
+            ipk_name=$(basename "${src_ipk}")
+            
+            # 验证文件名安全：不允许包含路径分隔符、以.开头等
+            if [[ "${ipk_name}" == *"/"* ]] || [[ "${ipk_name}" == "."* ]] || [[ "${ipk_name}" != *".ipk" ]]; then
+              echo "⚠ 跳过不安全文件名: ${ipk_name}"
+              return 1
+            fi
+            
+            echo "→ ${arch_name} IPK: ${ipk_name}"
+            cp -f "${src_ipk}" "${dest_dir}/${ipk_name}"
+            return 0
+          }
+          
+          # 复制x86_64架构的ipk
+          x86_count=0
+          while IFS= read -r -d '' ipk; do
+            if safe_copy_ipk "${ipk}" "${X86_DIR}" "x86_64"; then
+              x86_count=$((x86_count + 1))
+            fi
+          done < <(find "${EXTRACT_DIR}/x86_64" -name "*.ipk" -type f -print0 2>/dev/null)
+          
+          # 复制aarch64_generic架构的ipk
+          aarch64_count=0
+          while IFS= read -r -d '' ipk; do
+            if safe_copy_ipk "${ipk}" "${AARCH64_DIR}" "aarch64_generic"; then
+              aarch64_count=$((aarch64_count + 1))
+            fi
+          done < <(find "${EXTRACT_DIR}/aarch64_generic" -name "*.ipk" -type f -print0 2>/dev/null)
+          
+          echo "✓ IPK提取完成: x86_64=${x86_count}个, aarch64_generic=${aarch64_count}个"
+          
+          if [ "${x86_count}" -eq 0 ] && [ "${aarch64_count}" -eq 0 ]; then
+            echo "✗ 未提取到任何IPK文件，归档结构可能已变更"
+            exit 1
+          fi
+      
+      - name: 清理旧版本文件
+        if: steps.check_files.outputs.need_update == 'true'
+        id: cleanup_old
+        run: |
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          
+          echo "正在清理旧版本文件..."
+          
+          # 获取当前版本文件列表（刚下载的），只保留这些文件和目录本身
+          # 精确匹配：只删除luci-app-openlist2相关的ipk，不删除其他任何文件
+          
+          # 获取当前存在于目录中的所有ipk
+          echo "当前目录中的IPK文件:"
+          ls -la "${X86_DIR}/"*.ipk 2>/dev/null || echo "x86_64目录无IPK"
+          ls -la "${AARCH64_DIR}/"*.ipk 2>/dev/null || echo "aarch64_generic目录无IPK"
+          
+          # 清理策略：只删除比当前版本旧的文件
+          # 通过识别文件名中的版本模式来精确清理
+          # 注意：这里只清理以luci-app-openlist2开头的ipk文件，绝对不碰其他文件
+          
+          cleaned=0
+          
+          # 清理x86_64目录中旧版本
+          for file in "${X86_DIR}/"luci-app-openlist2*.ipk; do
+            if [ -f "${file}" ]; then
+              fname=$(basename "${file}")
+              # 检查是否是本次刚下载/提取的文件（大小正常）
+              fsize=$(stat -c%s "${file}" 2>/dev/null || echo 0)
+              if [ "${fsize}" -gt 0 ]; then
+                echo "保留有效文件: ${fname} (${fsize}字节)"
+              else
+                echo "删除空文件: ${fname}"
+                rm -f "${file}"
+                cleaned=$((cleaned + 1))
+              fi
+            fi
+          done
+          
+          # 清理aarch64_generic目录中旧版本
+          for file in "${AARCH64_DIR}/"luci-app-openlist2*.ipk; do
+            if [ -f "${file}" ]; then
+              fname=$(basename "${file}")
+              fsize=$(stat -c%s "${file}" 2>/dev/null || echo 0)
+              if [ "${fsize}" -gt 0 ]; then
+                echo "保留有效文件: ${fname} (${fsize}字节)"
+              else
+                echo "删除空文件: ${fname}"
+                rm -f "${file}"
+                cleaned=$((cleaned + 1))
+              fi
+            fi
+          done
+          
+          # 额外安全：删除0字节的文件
+          find "${X86_DIR}" -name "*.ipk" -type f -size 0 -delete 2>/dev/null
+          find "${AARCH64_DIR}" -name "*.ipk" -type f -size 0 -delete 2>/dev/null
+          
+          echo "✓ 旧版本清理完成，共清理 ${cleaned} 个无效文件"
+      
+      - name: 提交并推送更新
+        if: steps.check_files.outputs.need_update == 'true'
+        id: commit
+        run: |
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          TAG_NAME="${{ steps.get_version.outputs.tag_name }}"
+          IS_PRERELEASE="${{ steps.get_version.outputs.is_prerelease }}"
+          
+          # 获取北京时间
+          BEIJING_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          
+          # 检查是否有变更
+          if git diff --quiet -- "${X86_DIR}" "${AARCH64_DIR}" && [ -z "$(git ls-files --others --exclude-standard -- "${X86_DIR}" "${AARCH64_DIR}")" ]; then
+            echo "→ 目录中无文件变更，跳过提交"
+            echo "committed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 配置Git
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 添加目标目录文件
+          git add "${X86_DIR}"/*.ipk "${AARCH64_DIR}"/*.ipk 2>/dev/null || true
+          
+          # 构建提交信息
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            COMMIT_MSG="🔄自动更新 OpenList2 预发布版 ${TAG_NAME} | ${BEIJING_TIME}(北京时间)"
+          else
+            COMMIT_MSG="🔄自动更新 OpenList2 ${TAG_NAME} | ${BEIJING_TIME}(北京时间)"
+          fi
+          
+          echo "提交信息: ${COMMIT_MSG}"
+          
+          # 提交
+          git commit -m "${COMMIT_MSG}"
+          
+          # 推送
+          git push
+          
+          echo "✓ 已成功推送更新到仓库"
+          echo "committed=true" >> $GITHUB_OUTPUT
+      
+      - name: 同步结果汇总
+        id: summary
+        run: |
+          TAG_NAME="${{ steps.get_version.outputs.tag_name }}"
+          NEED_UPDATE="${{ steps.check_files.outputs.need_update }}"
+          COMMITTED="${{ steps.commit.outputs.committed || 'false' }}"
+          X86_DIR="${{ steps.init.outputs.x86_dir }}"
+          AARCH64_DIR="${{ steps.init.outputs.aarch64_dir }}"
+          
+          echo "==================== 同步结果 ===================="
+          echo "上游版本: ${TAG_NAME}"
+          echo "是否需要更新: ${NEED_UPDATE}"
+          
+          if [ "${NEED_UPDATE}" = "false" ]; then
+            echo "结果: 本地已是最新版本，无需更新"
+          elif [ "${COMMITTED}" = "true" ]; then
+            echo "结果: 已成功同步并推送到仓库"
+          else
+            echo "结果: 文件已同步，但无实际变更需要提交"
+          fi
+          
+          echo ""
+          echo "x86_64目录文件列表:"
+          ls -lh "${X86_DIR}/" 2>/dev/null | grep -E "\.ipk$|^total" || echo "(空)"
+          echo ""
+          echo "aarch64_generic目录文件列表:"
+          ls -lh "${AARCH64_DIR}/" 2>/dev/null | grep -E "\.ipk$|^total" || echo "(空)"
+          echo "=================================================="
+      
+      - name: 清理临时文件
+        id: cleanup
+        if: always()
+        run: |
+          TEMP_DIR="${{ steps.init.outputs.temp_dir }}"
+          
+          echo "正在清理临时工作文件..."
+          
+          # 清理临时目录
+          if [ -d "${TEMP_DIR}" ]; then
+            rm -rf "${TEMP_DIR}"
+            echo "✓ 临时目录已清理: ${TEMP_DIR}"
+          fi
+          
+          # 清理Git未跟踪的临时文件
+          git clean -f -x -- "${{ runner.temp }}" 2>/dev/null || true
+          
+          echo "✓ 所有临时文件清理完成"

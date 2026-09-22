@@ -1,0 +1,352 @@
+# ============================================================
+# rtp2httpd 插件自动同步工作流
+# 功能：定时检查上游最新版本（含预发布）并同步到本仓库
+# 适用环境：OpenWrt 24.10
+# ============================================================
+
+name: 自动更新 rtp2httpd IPK 软件包
+
+on:
+  # 每天北京时间早上06:27（UTC 22:27）定时触发
+  schedule:
+    - cron: '27 22 * * *'
+  # 手动触发，支持强制更新参数
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（勾选后即使本地已有该版本也会重新下载覆盖）'
+        required: false
+        type: boolean
+        default: false
+
+# 并发限制：同一时间只允许一个实例运行，排队等待
+concurrency:
+  group: rtp2httpd-sync
+  cancel-in-progress: false
+
+# 工作权限：需要代码推送权限
+permissions:
+  contents: write
+
+jobs:
+  sync-rtp2httpd:
+    name: 检查并同步最新版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Shanghai
+      UPSTREAM_API: 'https://api.github.com/repos/stackia/rtp2httpd/releases'
+      UPSTREAM_DOWNLOAD: 'https://github.com/stackia/rtp2httpd/releases/download'
+      UA_HEAD: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+      TMP_DIR: '/tmp/rtp2httpd-sync'
+      # 架构映射：目标架构名 => 仓库子目录（按用户要求）
+      # x86_64 → run/x86_64/luci-app-openlist2
+      # aarch64_generic → run/aarch64/luci-app-openlist2
+      ARCH_x86_64_DIR: 'run/x86_64/luci-app-openlist2'
+      ARCH_aarch64_generic_DIR: 'run/aarch64/luci-app-openlist2'
+
+    steps:
+      # ==================== 步骤1：检出代码 ====================
+      - name: 📥 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ==================== 步骤2：获取上游最新版本 ====================
+      - name: 🔍 获取上游最新版本信息
+        id: get_version
+        run: |
+          echo "===> 开始查询上游最新release..."
+          # 获取最近10个release（含预发布），按发布时间排序（GitHub默认按published_at降序）
+          # 不从 /latest 取，确保能获取到预发布/测试版
+          RESPONSE=$(curl -sSL \
+            --connect-timeout 30 \
+            --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "User-Agent: ${{ env.UA_HEAD }}" \
+            "${{ env.UPSTREAM_API }}?per_page=10")
+
+          # 检查API返回是否有效（非draft，按时间取最新的）
+          # 使用独立Python脚本文件避免引号转义问题
+          cat > /tmp/parse_release.py << 'PYEOF'
+          import json, sys
+          releases = json.load(sys.stdin)
+          # 过滤掉draft版本，按published_at降序排列，取第一个（最新）
+          valid = [r for r in releases if not r.get('draft', False)]
+          valid.sort(key=lambda x: x['published_at'], reverse=True)
+          if not valid:
+              print('ERROR: 未找到有效release', file=sys.stderr)
+              sys.exit(1)
+          latest = valid[0]
+          print('tag=' + latest['tag_name'])
+          print('version=' + latest['tag_name'].lstrip('v'))
+          print('prerelease=' + str(latest['prerelease']))
+          print('published=' + latest['published_at'])
+          # 校验需要的ipk文件是否都存在
+          assets = {a['name'] for a in latest['assets'] if a['name'].endswith('.ipk')}
+          required_x86_64 = any('x86_64.ipk' in a for a in assets)
+          required_aarch64 = any('aarch64_generic.ipk' in a for a in assets)
+          required_luci = any('luci-app-rtp2httpd_' in a and a.endswith('_all.ipk') for a in assets)
+          required_i18n = any('luci-i18n-rtp2httpd-zh-cn_' in a and a.endswith('_all.ipk') for a in assets)
+          if not all([required_x86_64, required_aarch64, required_luci, required_i18n]):
+              print('ERROR: 该版本缺少需要的ipk文件', file=sys.stderr)
+              print(f'  x86_64: {required_x86_64}', file=sys.stderr)
+              print(f'  aarch64_generic: {required_aarch64}', file=sys.stderr)
+              print(f'  luci-app: {required_luci}', file=sys.stderr)
+              print(f'  luci-i18n: {required_i18n}', file=sys.stderr)
+              sys.exit(2)
+          print('assets_valid=true')
+          PYEOF
+
+          LATEST=$(echo "$RESPONSE" | python3 /tmp/parse_release.py)
+          echo "$LATEST"
+          rm -f /tmp/parse_release.py
+
+          # 提取版本号
+          TAG_NAME=$(echo "$LATEST" | grep '^tag=' | head -1 | cut -d= -f2)
+          VERSION=$(echo "$LATEST" | grep '^version=' | head -1 | cut -d= -f2)
+          PRERELEASE=$(echo "$LATEST" | grep '^prerelease=' | head -1 | cut -d= -f2)
+          echo "===> 找到最新版本: $TAG_NAME"
+          echo "     版本号: $VERSION"
+          echo "     预发布: $PRERELEASE"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+
+      # ==================== 步骤3：检查是否需要更新 ====================
+      - name: ⚖️ 版本对比检查
+        id: check_update
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          # 手动触发时读取force_update参数，定时触发默认为false
+          FORCE="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FORCE="${{ github.event.inputs.force_update }}"
+            if [ -z "$FORCE" ]; then
+              FORCE="false"
+            fi
+          fi
+          echo "当前触发方式: ${{ github.event_name }}"
+          echo "当前上游版本: $VERSION"
+          echo "强制更新: $FORCE"
+
+          # 要检查的目标文件（6个ipk文件）
+          # x86_64目录放：rtp2httpd_x86_64 + 两个all包
+          # aarch64目录放：rtp2httpd_aarch64_generic + 两个all包
+          # 注意：luci-app和luci-i18n是all架构，两个目录都需要
+          FILES=(
+            "${{ env.ARCH_x86_64_DIR }}/rtp2httpd_${VERSION}-r1_x86_64.ipk"
+            "${{ env.ARCH_x86_64_DIR }}/luci-app-rtp2httpd_${VERSION}-r1_all.ipk"
+            "${{ env.ARCH_x86_64_DIR }}/luci-i18n-rtp2httpd-zh-cn_${VERSION}_all.ipk"
+            "${{ env.ARCH_aarch64_generic_DIR }}/rtp2httpd_${VERSION}-r1_aarch64_generic.ipk"
+            "${{ env.ARCH_aarch64_generic_DIR }}/luci-app-rtp2httpd_${VERSION}-r1_all.ipk"
+            "${{ env.ARCH_aarch64_generic_DIR }}/luci-i18n-rtp2httpd-zh-cn_${VERSION}_all.ipk"
+          )
+
+          ALL_EXIST=true
+          for f in "${FILES[@]}"; do
+            if [ -f "$f" ]; then
+              echo "✓ 文件已存在: $f"
+            else
+              echo "✗ 文件缺失: $f"
+              ALL_EXIST=false
+            fi
+          done
+
+          if [ "$FORCE" = "true" ]; then
+            echo "===> 强制更新模式，跳过存在性检查"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          elif [ "$ALL_EXIST" = "true" ]; then
+            echo "===> 版本 $VERSION 所有文件已存在，无需更新"
+            echo "need_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "===> 需要更新到版本 $VERSION"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ==================== 步骤4：下载新版本文件 ====================
+      - name: 📦 下载新版本安装包
+        if: steps.check_update.outputs.need_update == 'true'
+        id: download
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag_name }}"
+          echo "===> 创建临时目录: ${{ env.TMP_DIR }}"
+          mkdir -p "${{ env.TMP_DIR }}"
+          mkdir -p "${{ env.TMP_DIR }}/x86_64"
+          mkdir -p "${{ env.TMP_DIR }}/aarch64_generic"
+
+          BASE_URL="${{ env.UPSTREAM_DOWNLOAD }}/${TAG}"
+
+          # 下载函数：下载文件并验证
+          download_file() {
+            local filename="$1"
+            local dest_dir="$2"
+            local url="${BASE_URL}/${filename}"
+            local dest_path="${dest_dir}/${filename}"
+            echo "下载: $filename"
+            curl -fsSL \
+              --connect-timeout 30 \
+              --max-time 300 \
+              -H "User-Agent: ${{ env.UA_HEAD }}" \
+              -o "$dest_path" \
+              "$url"
+            if [ $? -ne 0 ]; then
+              echo "❌ 下载失败: $url"
+              exit 1
+            fi
+            # 验证文件大小
+            local fsize
+            fsize=$(stat -c%s "$dest_path" 2>/dev/null || echo 0)
+            echo "  大小: ${fsize} 字节"
+            if [ "$fsize" -lt 100 ]; then
+              echo "❌ 文件大小异常($fsize 字节)，可能下载失败"
+              exit 1
+            fi
+          }
+
+          echo "===> 开始下载文件..."
+
+          # x86_64架构主程序
+          download_file "rtp2httpd_${VERSION}-r1_x86_64.ipk" "${{ env.TMP_DIR }}/x86_64"
+          # aarch64_generic架构主程序
+          download_file "rtp2httpd_${VERSION}-r1_aarch64_generic.ipk" "${{ env.TMP_DIR }}/aarch64_generic"
+          # luci-app（all架构，两个目录都需要）
+          download_file "luci-app-rtp2httpd_${VERSION}-r1_all.ipk" "${{ env.TMP_DIR }}/x86_64"
+          # luci-i18n中文包（all架构，两个目录都需要）—— 注意：此文件没有-r1后缀
+          download_file "luci-i18n-rtp2httpd-zh-cn_${VERSION}_all.ipk" "${{ env.TMP_DIR }}/x86_64"
+
+          # 将all包复制到aarch64_generic临时目录（两目录都需要放all包）
+          echo "===> 复制all架构包到aarch64_generic目录..."
+          cp -v "${{ env.TMP_DIR }}/x86_64/luci-app-rtp2httpd_${VERSION}-r1_all.ipk" "${{ env.TMP_DIR }}/aarch64_generic/"
+          cp -v "${{ env.TMP_DIR }}/x86_64/luci-i18n-rtp2httpd-zh-cn_${VERSION}_all.ipk" "${{ env.TMP_DIR }}/aarch64_generic/"
+
+          echo "===> 所有文件下载完成"
+          echo "--- x86_64 文件 ---"
+          ls -la "${{ env.TMP_DIR }}/x86_64/"
+          echo "--- aarch64_generic 文件 ---"
+          ls -la "${{ env.TMP_DIR }}/aarch64_generic/"
+
+      # ==================== 步骤5：清理旧版本文件（精确删除） ====================
+      - name: 🧹 清理旧版本相关文件
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          echo "===> 开始清理旧版本文件..."
+
+          # 清理函数：只删除匹配rtp2httpd相关ipk的旧文件
+          # 使用精确前缀匹配，避免误删其他文件
+          clean_dir() {
+            local target_dir="$1"
+            echo "清理目录: $target_dir"
+            if [ ! -d "$target_dir" ]; then
+              mkdir -p "$target_dir"
+              echo "  目录不存在，已创建"
+              return
+            fi
+            # 只删除匹配以下前缀的.ipk文件：
+            # - rtp2httpd_
+            # - luci-app-rtp2httpd_
+            # - luci-i18n-rtp2httpd-zh-cn_
+            # 严格匹配，防止误删其他文件
+            find "$target_dir" -maxdepth 1 -type f -name "rtp2httpd_*.ipk" -print0 | while IFS= read -r -d '' f; do
+              echo "  删除旧文件: $(basename "$f")"
+              rm -f "$f"
+            done
+            find "$target_dir" -maxdepth 1 -type f -name "luci-app-rtp2httpd_*.ipk" -print0 | while IFS= read -r -d '' f; do
+              echo "  删除旧文件: $(basename "$f")"
+              rm -f "$f"
+            done
+            find "$target_dir" -maxdepth 1 -type f -name "luci-i18n-rtp2httpd-zh-cn_*.ipk" -print0 | while IFS= read -r -d '' f; do
+              echo "  删除旧文件: $(basename "$f")"
+              rm -f "$f"
+            done
+          }
+
+          clean_dir "${{ env.ARCH_x86_64_DIR }}"
+          clean_dir "${{ env.ARCH_aarch64_generic_DIR }}"
+          echo "===> 旧版本清理完成"
+
+      # ==================== 步骤6：放置新文件 ====================
+      - name: 📂 部署新版本文件到仓库
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          echo "===> 创建目标目录..."
+          mkdir -p "${{ env.ARCH_x86_64_DIR }}"
+          mkdir -p "${{ env.ARCH_aarch64_generic_DIR }}"
+
+          echo "===> 复制 x86_64 文件..."
+          cp -v "${{ env.TMP_DIR }}/x86_64/"*.ipk "${{ env.ARCH_x86_64_DIR }}/"
+
+          echo "===> 复制 aarch64_generic 文件..."
+          cp -v "${{ env.TMP_DIR }}/aarch64_generic/"*.ipk "${{ env.ARCH_aarch64_generic_DIR }}/"
+
+          echo "===> 部署完成，目标文件列表："
+          echo "--- x86_64 ---"
+          ls -la "${{ env.ARCH_x86_64_DIR }}/"
+          echo "--- aarch64_generic ---"
+          ls -la "${{ env.ARCH_aarch64_generic_DIR }}/"
+
+      # ==================== 步骤7：提交并推送 ====================
+      - name: 📝 提交并推送更新
+        if: steps.check_update.outputs.need_update == 'true'
+        id: commit
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          PRERELEASE="${{ steps.get_version.outputs.prerelease }}"
+          # 获取北京时间
+          BEIJING_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          # 版本标识
+          if [ "$PRERELEASE" = "True" ]; then
+            VER_TAG="测试版 ${VERSION}"
+          else
+            VER_TAG="正式版 ${VERSION}"
+          fi
+          echo "===> 配置git用户信息..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "===> 添加变更文件..."
+          git add "${{ env.ARCH_x86_64_DIR }}/"*.ipk "${{ env.ARCH_aarch64_generic_DIR }}/"*.ipk
+          echo "===> 检查是否有变更..."
+          if git diff --cached --quiet; then
+            echo "⚠️ 没有文件变更，跳过提交"
+            echo "has_commit=false" >> $GITHUB_OUTPUT
+          else
+            COMMIT_MSG="🔄自动更新 rtp2httpd ${VER_TAG} | ${BEIJING_TIME}(北京时间)"
+            echo "提交信息: $COMMIT_MSG"
+            git commit -m "$COMMIT_MSG"
+            echo "===> 推送到仓库..."
+            git push
+            echo "✅ 推送成功"
+            echo "has_commit=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ==================== 步骤8：清理临时文件（无论成功失败都执行） ====================
+      - name: 🗑️ 清理临时缓存
+        if: always()
+        run: |
+          echo "===> 清理临时目录..."
+          rm -rf "${{ env.TMP_DIR }}"
+          echo "===> 临时文件已清理完毕"
+
+      # ==================== 总结输出 ====================
+      - name: 📊 执行结果总结
+        if: always()
+        run: |
+          echo "========================================="
+          echo "          rtp2httpd 同步执行报告          "
+          echo "========================================="
+          echo "上游版本: ${{ steps.get_version.outputs.version }}"
+          echo "是否预发布: ${{ steps.get_version.outputs.prerelease }}"
+          echo "是否需要更新: ${{ steps.check_update.outputs.need_update }}"
+          if [ "${{ steps.check_update.outputs.need_update }}" = "true" ]; then
+            echo "提交状态: ${{ steps.commit.outputs.has_commit }}"
+          else
+            echo "状态: ✅ 当前已是最新版本"
+          fi
+          echo "执行时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') (北京时间)"
+          echo "========================================="

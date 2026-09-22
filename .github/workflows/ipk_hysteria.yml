@@ -1,0 +1,282 @@
+# ============================================================
+# Hysteria OpenWrt IPK 自动构建与版本同步工作流
+# 功能：定时检查上游最新版本(含预发布版) -> 下载 -> 打包ipk -> 自动推送
+# 适用：OpenWrt 24.10
+# 架构：x86_64(amd64)、aarch64(arm64)
+# ============================================================
+
+name: 自动构建 Hysteria IPK 安装包
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+  schedule:
+    - cron: '32 22 * * *'		# 每天 UTC 时间 22:32（北京时间 06:32）定时触发
+
+  workflow_dispatch:		  # 手动触发，支持强制更新参数
+    inputs:
+      force_update:
+        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write				# 授予工作流必要的权限
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false		# 并发限制：同一分支同一时间仅运行一个，排队等待不中断进行中的构建
+
+jobs:
+  build_and_sync:
+    runs-on: ubuntu-latest
+    name: 检查版本并构建同步
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 准备工作目录
+        run: |
+          BUILD_DIR="/tmp/hysteria-build"
+          echo "BUILD_DIR=${BUILD_DIR}" >> $GITHUB_ENV
+          rm -rf "${BUILD_DIR}"
+          mkdir -p "${BUILD_DIR}"
+          mkdir -p "${GITHUB_WORKSPACE}/run/x86_64/hysteria-core"
+          mkdir -p "${GITHUB_WORKSPACE}/run/aarch64/hysteria-core"
+
+      - name: 获取上游最新版本（含预发布版）
+        id: get_version
+        run: |
+          echo "正在获取上游版本信息..."
+          RELEASE_JSON=$(curl -s -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            "https://api.github.com/repos/HyNetworks/hysteria/releases")
+          TAG_NAME=$(echo "${RELEASE_JSON}" | jq -r '.[0].tag_name')
+          VERSION=$(echo "${TAG_NAME}" | sed 's|^app/v||')
+          PRERELEASE=$(echo "${RELEASE_JSON}" | jq -r '.[0].prerelease')
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+            echo "获取版本失败，退出"
+            exit 1
+          fi
+          echo "最新版本: ${VERSION}"
+          echo "是否预发布版: ${PRERELEASE}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}" >> $GITHUB_OUTPUT
+          AMD64_URL="https://github.com/HyNetworks/hysteria/releases/download/${TAG_NAME}/hysteria-linux-amd64"
+          ARM64_URL="https://github.com/HyNetworks/hysteria/releases/download/${TAG_NAME}/hysteria-linux-arm64"
+          echo "amd64_url=${AMD64_URL}" >> $GITHUB_OUTPUT
+          echo "arm64_url=${ARM64_URL}" >> $GITHUB_OUTPUT
+
+      - name: 检查文件是否已存在
+        id: check_exist
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          FORCE="${{ inputs.force_update || 'false' }}"
+          IPK_X86_64="${GITHUB_WORKSPACE}/run/x86_64/hysteria-core/hysteria_${VERSION}-1_x86_64.ipk"
+          IPK_AARCH64="${GITHUB_WORKSPACE}/run/aarch64/hysteria-core/hysteria_${VERSION}-1_aarch64.ipk"
+          echo "x86_64文件路径: ${IPK_X86_64}"
+          echo "aarch64文件路径: ${IPK_AARCH64}"
+          if [ "${FORCE}" = "false" ] && [ -f "${IPK_X86_64}" ] && [ -f "${IPK_AARCH64}" ]; then
+            echo "当前版本 ${VERSION} 的两个架构IPK都已存在，跳过构建"
+            echo "need_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "需要构建新版本 ${VERSION}"
+            echo "need_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 下载二进制文件
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          BUILD_DIR="${{ env.BUILD_DIR }}"
+          echo "下载amd64二进制..."
+          curl -L --retry 3 -H "User-Agent: Mozilla/5.0" \
+            -o "${BUILD_DIR}/hysteria-linux-amd64" \
+            "${{ steps.get_version.outputs.amd64_url }}"
+          chmod +x "${BUILD_DIR}/hysteria-linux-amd64"
+          echo "下载arm64二进制..."
+          curl -L --retry 3 -H "User-Agent: Mozilla/5.0" \
+            -o "${BUILD_DIR}/hysteria-linux-arm64" \
+            "${{ steps.get_version.outputs.arm64_url }}"
+          chmod +x "${BUILD_DIR}/hysteria-linux-arm64"
+          echo "下载完成"
+          ls -lh "${BUILD_DIR}/"
+
+      - name: 清理本工作流生成的旧版本文件
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          echo "清理x86_64目录下旧版IPK..."
+          find "${GITHUB_WORKSPACE}/run/x86_64/hysteria-core" -maxdepth 1 -type f \
+            -regextype posix-extended \
+            -regex '^.*/hysteria_[0-9]+\.[0-9]+\.[0-9]+-[0-9]+_x86_64\.ipk$' \
+            -delete -print
+          echo "清理aarch64目录下旧版IPK..."
+          find "${GITHUB_WORKSPACE}/run/aarch64/hysteria-core" -maxdepth 1 -type f \
+            -regextype posix-extended \
+            -regex '^.*/hysteria_[0-9]+\.[0-9]+\.[0-9]+-[0-9]+_aarch64\.ipk$' \
+            -delete -print
+          echo "旧版本清理完成"
+
+      - name: 构建x86_64架构IPK
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          BUILD_DIR="${{ env.BUILD_DIR }}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          ARCH_SRC="linux-amd64"
+          ARCH_DST="x86_64"
+          PKG_DIR="${BUILD_DIR}/${ARCH_DST}_pkg"
+          echo "构建 ${ARCH_DST} IPK..."
+          rm -rf "${PKG_DIR}"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/CONTROL"
+          cp "${BUILD_DIR}/hysteria-${ARCH_SRC}" "${PKG_DIR}/usr/bin/hysteria"
+          chmod 755 "${PKG_DIR}/usr/bin/hysteria"
+          FILE_SIZE=$(du -k "${PKG_DIR}/usr/bin/hysteria" | cut -f1)
+          {
+            echo "Package: hysteria"
+            echo "Version: ${VERSION}-1"
+            echo "Architecture: ${ARCH_DST}"
+            echo "Maintainer: HyNetworks"
+            echo "Installed-Size: ${FILE_SIZE}"
+            echo "Depends: libc"
+            echo "Section: net"
+            echo "Priority: optional"
+            echo "Description: Hysteria is a feature-packed proxy and relay tool"
+          } > "${PKG_DIR}/CONTROL/control"
+          printf '#!/bin/sh\nchmod +x /usr/bin/hysteria\nexit 0\n' > "${PKG_DIR}/CONTROL/postinst"
+          chmod 755 "${PKG_DIR}/CONTROL/postinst"
+          echo "2.0" > "${PKG_DIR}/debian-binary"
+          tar -czf "${BUILD_DIR}/control.tar.gz" -C "${PKG_DIR}/CONTROL" .
+          tar -czf "${BUILD_DIR}/data.tar.gz" -C "${PKG_DIR}" ./usr
+          IPK_NAME="hysteria_${VERSION}-1_${ARCH_DST}.ipk"
+          cd "${BUILD_DIR}"
+          ar r "${IPK_NAME}" \
+            "${PKG_DIR}/debian-binary" \
+            "${BUILD_DIR}/control.tar.gz" \
+            "${BUILD_DIR}/data.tar.gz"
+          REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
+          mkdir -p "${REPO_DIR}"
+          cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
+          echo "${ARCH_DST} IPK构建完成，已复制到仓库目录 ${REPO_DIR}"
+          ls -lh "${REPO_DIR}/${IPK_NAME}"
+
+      - name: 构建aarch64架构IPK
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          BUILD_DIR="${{ env.BUILD_DIR }}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          ARCH_SRC="linux-arm64"
+          ARCH_DST="aarch64"
+          PKG_DIR="${BUILD_DIR}/${ARCH_DST}_pkg"
+          echo "构建 ${ARCH_DST} IPK..."
+          rm -rf "${PKG_DIR}"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/CONTROL"
+          cp "${BUILD_DIR}/hysteria-${ARCH_SRC}" "${PKG_DIR}/usr/bin/hysteria"
+          chmod 755 "${PKG_DIR}/usr/bin/hysteria"
+          FILE_SIZE=$(du -k "${PKG_DIR}/usr/bin/hysteria" | cut -f1)
+          {
+            echo "Package: hysteria"
+            echo "Version: ${VERSION}-1"
+            echo "Architecture: ${ARCH_DST}"
+            echo "Maintainer: HyNetworks"
+            echo "Installed-Size: ${FILE_SIZE}"
+            echo "Depends: libc"
+            echo "Section: net"
+            echo "Priority: optional"
+            echo "Description: Hysteria is a feature-packed proxy and relay tool"
+          } > "${PKG_DIR}/CONTROL/control"
+          printf '#!/bin/sh\nchmod +x /usr/bin/hysteria\nexit 0\n' > "${PKG_DIR}/CONTROL/postinst"
+          chmod 755 "${PKG_DIR}/CONTROL/postinst"
+          echo "2.0" > "${PKG_DIR}/debian-binary"
+          tar -czf "${BUILD_DIR}/control.tar.gz" -C "${PKG_DIR}/CONTROL" .
+          tar -czf "${BUILD_DIR}/data.tar.gz" -C "${PKG_DIR}" ./usr
+          IPK_NAME="hysteria_${VERSION}-1_${ARCH_DST}.ipk"
+          cd "${BUILD_DIR}"
+          ar r "${IPK_NAME}" \
+            "${PKG_DIR}/debian-binary" \
+            "${BUILD_DIR}/control.tar.gz" \
+            "${BUILD_DIR}/data.tar.gz"
+          REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
+          mkdir -p "${REPO_DIR}"
+          cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
+          echo "${ARCH_DST} IPK构建完成，已复制到仓库目录 ${REPO_DIR}"
+          ls -lh "${REPO_DIR}/${IPK_NAME}"
+
+      - name: IPK完整性校验
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          BUILD_DIR="${{ env.BUILD_DIR }}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          echo "开始校验IPK完整性..."
+          for ARCH in x86_64 aarch64; do
+            IPK_FILE="${GITHUB_WORKSPACE}/run/${ARCH}/hysteria-core/hysteria_${VERSION}-1_${ARCH}.ipk"
+            echo "校验 ${IPK_FILE}..."
+            if [ ! -f "${IPK_FILE}" ]; then
+              echo "错误：${IPK_FILE} 不存在于仓库目录！"
+              exit 1
+            fi
+            FILE_SIZE=$(stat -c%s "${IPK_FILE}")
+            if [ "${FILE_SIZE}" -lt 1048576 ]; then
+              echo "错误：${IPK_FILE} 文件过小（${FILE_SIZE}字节），可能构建失败"
+              exit 1
+            fi
+            VERIFY_DIR="${BUILD_DIR}/verify_${ARCH}"
+            mkdir -p "${VERIFY_DIR}"
+            cd "${VERIFY_DIR}"
+            if ! ar x "${IPK_FILE}"; then
+              echo "错误：${IPK_FILE} 不是有效的ar包"
+              exit 1
+            fi
+            for f in debian-binary control.tar.gz data.tar.gz; do
+              if [ ! -f "${f}" ]; then
+                echo "错误：${IPK_FILE} 缺少 ${f}"
+                exit 1
+              fi
+            done
+            if ! tar tzf data.tar.gz | grep -q "./usr/bin/hysteria"; then
+              echo "错误：${IPK_FILE} data.tar.gz中未找到usr/bin/hysteria"
+              exit 1
+            fi
+            echo "${ARCH} IPK校验通过，文件大小: ${FILE_SIZE}字节"
+          done
+          echo "所有IPK完整性校验通过！"
+          echo ""
+          echo "仓库目录中的文件列表："
+          ls -lh "${GITHUB_WORKSPACE}/run/x86_64/hysteria-core/"
+          ls -lh "${GITHUB_WORKSPACE}/run/aarch64/hysteria-core/"
+
+      - name: 提交并推送更新
+        if: steps.check_exist.outputs.need_build == 'true'
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          PRERELEASE="${{ steps.get_version.outputs.prerelease }}"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          BJ_TIME=$(TZ="Asia/Shanghai" date "+%Y-%m-%d %H:%M:%S")
+          if [ "${PRERELEASE}" = "true" ]; then
+            COMMIT_MSG="🔄自动构建 Hysteria 预发布版 v${VERSION} | ${BJ_TIME}(北京时间)"
+          else
+            COMMIT_MSG="🔄自动构建 Hysteria v${VERSION} | ${BJ_TIME}(北京时间)"
+          fi
+          echo "提交信息: ${COMMIT_MSG}"
+          git add "run/x86_64/hysteria-core/*.ipk"
+          git add "run/aarch64/hysteria-core/*.ipk"
+          echo ""
+          echo "Git状态："
+          git status
+          git commit -m "${COMMIT_MSG}"
+          git push
+          echo "推送成功！"
+
+      - name: 清理临时构建文件
+        if: always()
+        run: |
+          echo "清理临时文件..."
+          rm -rf "${{ env.BUILD_DIR }}"
+          echo "临时文件清理完成"

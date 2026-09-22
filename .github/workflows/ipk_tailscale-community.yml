@@ -1,0 +1,480 @@
+# ============================================================
+# Tailscale 社区版 OpenWrt 插件自动更新工作流
+# 功能：定时检查上游最新版本并同步到本仓库
+# 环境：OpenWrt 24.10（仅支持 ipk 格式）
+# 架构：x86_64、aarch64_generic
+# ============================================================
+
+name: 自动同步 Tailscale IPK 软件包
+
+# --------------------------
+# 触发条件配置
+# --------------------------
+on:
+  schedule:
+    - cron: '25 22 * * *'	# 每天定时自动运行（北京时间 06:25 对应 UTC 22:25）
+  
+  # 手动触发，支持强制更新
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（勾选后即使本地已有该版本也会重新下载覆盖）'
+        required: false
+        type: boolean
+        default: false
+
+# --------------------------
+# 并发控制：防止同时运行冲突
+# --------------------------
+concurrency:
+  group: tailscale-update-workflow
+  cancel-in-progress: false
+
+# --------------------------
+# 权限配置：仅需要推送代码权限
+# --------------------------
+permissions:
+  contents: write
+
+# --------------------------
+# 工作流任务
+# --------------------------
+jobs:
+  Tailscale:
+    name: 📦 检查并同步最新版本
+    runs-on: ubuntu-latest
+    
+    # 工作目录固定，防止漂移
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+        shell: bash
+    
+    steps:
+      # --------------------------------------------------
+      # 步骤 1：检出仓库代码
+      # --------------------------------------------------
+      - name: 📥 检出当前仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}		# 使用持久化令牌推送
+          fetch-depth: 0		# 拉取完整历史以便精确清理旧版本
+
+      # --------------------------------------------------
+      # 步骤 2：配置 Git 用户信息
+      # --------------------------------------------------
+      - name: ⚙️ 配置 Git 提交环境
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "✅ Git 环境配置完成"
+
+      # --------------------------------------------------
+      # 步骤 3：获取上游最新版本信息（使用 jq 可靠解析 JSON）
+      # --------------------------------------------------
+      - name: 🔍 获取上游最新发布信息
+        id: get_version
+        run: |
+          echo "开始查询上游最新版本..."
+          
+          # 使用标准浏览器 UA 头访问 GitHub API，防止被拦截
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          
+          # 保存 API 返回结果到临时文件，避免多次 curl 调用
+          RELEASE_JSON_FILE="${RUNNER_TEMP}/release.json"
+          curl -s -L -f -H "User-Agent: ${UA}" \
+            "https://api.github.com/repos/Tokisaki-Galaxy/luci-app-tailscale-community/releases/latest" \
+            -o "${RELEASE_JSON_FILE}"
+          
+          if [ ! -s "${RELEASE_JSON_FILE}" ]; then
+            echo "❌ 无法获取上游 release 信息，任务终止"
+            exit 1
+          fi
+          
+          # 使用 jq 提取版本号（去掉 v 前缀）
+          UPSTREAM_TAG=$(jq -r '.tag_name' "${RELEASE_JSON_FILE}" | sed -E 's/^v//')
+          
+          if [ -z "${UPSTREAM_TAG}" ] || [ "${UPSTREAM_TAG}" = "null" ]; then
+            echo "❌ 无法获取上游版本号，任务终止"
+            exit 1
+          fi
+          echo "📌 上游最新版本：${UPSTREAM_TAG}"
+          
+          # 使用 jq 精确提取需要的两个 ipk 文件信息
+          # 精确匹配主程序包（排除 apk、其他语言包）
+          APP_IPK=$(jq -r '.assets[] | select(.name | startswith("luci-app-tailscale-community_") and endswith("_all.ipk")) | .name' "${RELEASE_JSON_FILE}" | head -1)
+          I18N_IPK=$(jq -r '.assets[] | select(.name | startswith("luci-i18n-tailscale-community-zh-cn_") and endswith("_all.ipk")) | .name' "${RELEASE_JSON_FILE}" | head -1)
+          
+          echo "主程序包文件名：${APP_IPK}"
+          echo "中文语言包文件名：${I18N_IPK}"
+          
+          if [ -z "${APP_IPK}" ] || [ "${APP_IPK}" = "null" ]; then
+            echo "❌ 无法获取主程序包 ipk 文件名"
+            exit 1
+          fi
+          if [ -z "${I18N_IPK}" ] || [ "${I18N_IPK}" = "null" ]; then
+            echo "❌ 无法获取中文语言包 ipk 文件名"
+            exit 1
+          fi
+          
+          # 使用 jq 提取下载链接
+          APP_URL=$(jq -r --arg name "${APP_IPK}" '.assets[] | select(.name == $name) | .browser_download_url' "${RELEASE_JSON_FILE}")
+          I18N_URL=$(jq -r --arg name "${I18N_IPK}" '.assets[] | select(.name == $name) | .browser_download_url' "${RELEASE_JSON_FILE}")
+          
+          if [ -z "${APP_URL}" ] || [ "${APP_URL}" = "null" ]; then
+            echo "❌ 无法获取主程序包下载链接"
+            exit 1
+          fi
+          if [ -z "${I18N_URL}" ] || [ "${I18N_URL}" = "null" ]; then
+            echo "❌ 无法获取中文语言包下载链接"
+            exit 1
+          fi
+          
+          echo "主程序包下载链接：${APP_URL}"
+          echo "中文语言包下载链接：${I18N_URL}"
+          
+          # 输出变量供后续步骤使用
+          echo "tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "app_ipk=${APP_IPK}" >> "$GITHUB_OUTPUT"
+          echo "i18n_ipk=${I18N_IPK}" >> "$GITHUB_OUTPUT"
+          echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
+          echo "i18n_url=${I18N_URL}" >> "$GITHUB_OUTPUT"
+          
+          # 清理临时 JSON 文件
+          rm -f "${RELEASE_JSON_FILE}"
+          
+          echo "✅ 版本信息获取完成"
+
+      # --------------------------------------------------
+      # 步骤 4：版本对比检查（纯文件名对比）
+      # --------------------------------------------------
+      - name: 🆚 版本对比检查
+        id: check_version
+        run: |
+          FORCE="${{ github.event.inputs.force_update || 'false' }}"
+          APP_IPK="${{ steps.get_version.outputs.app_ipk }}"
+          I18N_IPK="${{ steps.get_version.outputs.i18n_ipk }}"
+          
+          echo "⚙️ 强制更新开关：${FORCE}"
+          
+          # 定义两个架构的目标目录
+          ARCH_DIRS=(
+            "run/x86_64/luci-app-tailscale"
+            "run/aarch64/luci-app-tailscale"
+          )
+          
+          NEED_UPDATE="false"
+          
+          if [ "${FORCE}" = "true" ]; then
+            echo "⚠️ 已开启强制更新模式"
+            NEED_UPDATE="true"
+          else
+            # 开启 nullglob：无匹配时通配符展开为空，避免字面值陷阱
+            shopt -s nullglob
+            
+            # 检查每个目录下两个文件是否都存在
+            for dir in "${ARCH_DIRS[@]}"; do
+              APP_EXIST="false"
+              I18N_EXIST="false"
+              
+              if [ -f "${dir}/${APP_IPK}" ]; then
+                APP_EXIST="true"
+              fi
+              
+              if [ -f "${dir}/${I18N_IPK}" ]; then
+                I18N_EXIST="true"
+              fi
+              
+              echo "📂 目录 ${dir}："
+              if [ "${APP_EXIST}" = "true" ]; then
+                echo "   主程序包：✅ 已存在"
+              else
+                echo "   主程序包：❌ 不存在"
+              fi
+              if [ "${I18N_EXIST}" = "true" ]; then
+                echo "   中文语言包：✅ 已存在"
+              else
+                echo "   中文语言包：❌ 不存在"
+              fi
+              
+              # 只要有一个文件缺失，就需要更新
+              if [ "${APP_EXIST}" = "false" ] || [ "${I18N_EXIST}" = "false" ]; then
+                NEED_UPDATE="true"
+              fi
+            done
+            
+            shopt -u nullglob
+          fi
+          
+          if [ "${NEED_UPDATE}" = "false" ]; then
+            echo "✅ 所有目录下最新版本文件已全部存在，跳过更新"
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🔔 检测到需要更新"
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --------------------------------------------------
+      # 步骤 5：下载最新 ipk 包
+      # --------------------------------------------------
+      - name: ⬇️ 下载最新 ipk 安装包
+        if: steps.check_version.outputs.need_update == 'true'
+        id: download
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          
+          APP_URL="${{ steps.get_version.outputs.app_url }}"
+          I18N_URL="${{ steps.get_version.outputs.i18n_url }}"
+          APP_IPK="${{ steps.get_version.outputs.app_ipk }}"
+          I18N_IPK="${{ steps.get_version.outputs.i18n_ipk }}"
+          
+          # 创建临时下载目录（在 RUNNER_TEMP 下，避免污染工作目录）
+          TMP_DIR="${RUNNER_TEMP}/tailscale_download"
+          mkdir -p "${TMP_DIR}"
+          echo "TMP_DIR=${TMP_DIR}" >> "$GITHUB_OUTPUT"
+          echo "📂 临时下载目录：${TMP_DIR}"
+          
+          # 下载主程序包（-f 让 HTTP 错误时 curl 返回非零退出码）
+          echo "正在下载主程序包：${APP_IPK}"
+          curl -fL --retry 3 --retry-delay 2 -H "User-Agent: ${UA}" \
+            -o "${TMP_DIR}/${APP_IPK}" "${APP_URL}"
+          if [ ! -s "${TMP_DIR}/${APP_IPK}" ]; then
+            echo "❌ 主程序包下载失败或文件为空"
+            exit 1
+          fi
+          APP_SIZE=$(stat -c%s "${TMP_DIR}/${APP_IPK}")
+          echo "✅ 主程序包下载完成，大小：${APP_SIZE} 字节"
+          
+          # 下载中文语言包
+          echo "正在下载中文语言包：${I18N_IPK}"
+          curl -fL --retry 3 --retry-delay 2 -H "User-Agent: ${UA}" \
+            -o "${TMP_DIR}/${I18N_IPK}" "${I18N_URL}"
+          if [ ! -s "${TMP_DIR}/${I18N_IPK}" ]; then
+            echo "❌ 中文语言包下载失败或文件为空"
+            exit 1
+          fi
+          I18N_SIZE=$(stat -c%s "${TMP_DIR}/${I18N_IPK}")
+          echo "✅ 中文语言包下载完成，大小：${I18N_SIZE} 字节"
+          
+          # ipk 文件格式校验：OpenWrt 24.10 的 ipk 是 gzip 压缩的 tar 包，首字节为 0x1f 0x8b（gzip 头）
+          # 包内必须包含 debian-binary 文件
+          APP_MAGIC=$(head -c 2 "${TMP_DIR}/${APP_IPK}" | od -An -tx1 | tr -d ' \n')
+          I18N_MAGIC=$(head -c 2 "${TMP_DIR}/${I18N_IPK}" | od -An -tx1 | tr -d ' \n')
+          if [ "${APP_MAGIC}" != "1f8b" ]; then
+            echo "❌ 主程序包文件头校验失败（期望 gzip 格式 0x1f8b），可能下载的不是 ipk"
+            echo "实际文件头：${APP_MAGIC}"
+            exit 1
+          fi
+          if [ "${I18N_MAGIC}" != "1f8b" ]; then
+            echo "❌ 中文语言包文件头校验失败（期望 gzip 格式 0x1f8b），可能下载的不是 ipk"
+            echo "实际文件头：${I18N_MAGIC}"
+            exit 1
+          fi
+          
+          # 进一步验证 tar 包内含 debian-binary（ipk 标准结构）
+          if ! tar tzf "${TMP_DIR}/${APP_IPK}" 2>/dev/null | grep -q "debian-binary"; then
+            echo "❌ 主程序包缺少 debian-binary，不是有效的 ipk 包"
+            exit 1
+          fi
+          echo "✅ ipk 文件格式校验通过（gzip tar 包，含 debian-binary）"
+
+      # --------------------------------------------------
+      # 步骤 6：安全清理本工作流相关旧版本文件
+      # --------------------------------------------------
+      - name: 🧹 安全清理旧版本文件
+        if: steps.check_version.outputs.need_update == 'true'
+        id: cleanup
+        run: |
+          echo "开始精确清理旧版本文件..."
+          
+          APP_IPK="${{ steps.get_version.outputs.app_ipk }}"
+          I18N_IPK="${{ steps.get_version.outputs.i18n_ipk }}"
+          
+          # 定义目标目录
+          ARCH_DIRS=(
+            "run/x86_64/luci-app-tailscale"
+            "run/aarch64/luci-app-tailscale"
+          )
+          
+          CLEANED_COUNT=0
+          
+          # 开启 nullglob 防止通配符匹配到字面值
+          shopt -s nullglob
+          
+          for dir in "${ARCH_DIRS[@]}"; do
+            echo "📂 清理目录：${dir}"
+            
+            # 创建目录（如果不存在）
+            mkdir -p "${dir}"
+            
+            if [ -d "${dir}" ]; then
+              # 仅删除本工作流管理的旧版本主程序包文件（精确前缀匹配）
+              # 匹配规则：luci-app-tailscale-community_ 开头、_all.ipk 结尾，但不是当前版本
+              for oldfile in "${dir}"/luci-app-tailscale-community_*_all.ipk; do
+                if [ -f "${oldfile}" ]; then
+                  fname=$(basename "${oldfile}")
+                  if [ "${fname}" != "${APP_IPK}" ]; then
+                    echo "   删除旧版本主程序包：${fname}"
+                    rm -f "${oldfile}"
+                    CLEANED_COUNT=$((CLEANED_COUNT + 1))
+                  else
+                    echo "   保留当前版本主程序包：${fname}"
+                  fi
+                fi
+              done
+              
+              # 仅删除本工作流管理的旧版本中文语言包文件（精确前缀匹配）
+              # 匹配规则：luci-i18n-tailscale-community-zh-cn_ 开头、_all.ipk 结尾，但不是当前版本
+              for oldfile in "${dir}"/luci-i18n-tailscale-community-zh-cn_*_all.ipk; do
+                if [ -f "${oldfile}" ]; then
+                  fname=$(basename "${oldfile}")
+                  if [ "${fname}" != "${I18N_IPK}" ]; then
+                    echo "   删除旧版本语言包：${fname}"
+                    rm -f "${oldfile}"
+                    CLEANED_COUNT=$((CLEANED_COUNT + 1))
+                  else
+                    echo "   保留当前版本语言包：${fname}"
+                  fi
+                fi
+              done
+            fi
+          done
+          
+          shopt -u nullglob
+          
+          echo "✅ 旧版本清理完成，共删除 ${CLEANED_COUNT} 个旧文件"
+
+      # --------------------------------------------------
+      # 步骤 7：部署新版本文件到对应架构目录
+      # --------------------------------------------------
+      - name: 📤 部署新版本文件到架构目录
+        if: steps.check_version.outputs.need_update == 'true'
+        id: deploy
+        run: |
+          TMP_DIR="${{ steps.download.outputs.TMP_DIR }}"
+          APP_IPK="${{ steps.get_version.outputs.app_ipk }}"
+          I18N_IPK="${{ steps.get_version.outputs.i18n_ipk }}"
+          TAG="${{ steps.get_version.outputs.tag }}"
+          
+          ARCH_DIRS=(
+            "run/x86_64/luci-app-tailscale"
+            "run/aarch64/luci-app-tailscale"
+          )
+          
+          DEPLOY_COUNT=0
+          
+          for dir in "${ARCH_DIRS[@]}"; do
+            echo "📂 部署到目录：${dir}"
+            mkdir -p "${dir}"
+            
+            # 复制主程序包
+            cp -f "${TMP_DIR}/${APP_IPK}" "${dir}/${APP_IPK}"
+            echo "   已部署主程序包：${APP_IPK}"
+            DEPLOY_COUNT=$((DEPLOY_COUNT + 1))
+            
+            # 复制中文语言包
+            cp -f "${TMP_DIR}/${I18N_IPK}" "${dir}/${I18N_IPK}"
+            echo "   已部署中文语言包：${I18N_IPK}"
+            DEPLOY_COUNT=$((DEPLOY_COUNT + 1))
+          done
+          
+          echo "✅ 文件部署完成，共部署 ${DEPLOY_COUNT} 个文件"
+          
+          # 最终验证文件存在且非空
+          VERIFY_PASS="true"
+          for dir in "${ARCH_DIRS[@]}"; do
+            if [ ! -s "${dir}/${APP_IPK}" ]; then
+              echo "❌ 部署验证失败：${dir}/${APP_IPK} 不存在或为空"
+              VERIFY_PASS="false"
+            fi
+            if [ ! -s "${dir}/${I18N_IPK}" ]; then
+              echo "❌ 部署验证失败：${dir}/${I18N_IPK} 不存在或为空"
+              VERIFY_PASS="false"
+            fi
+          done
+          
+          if [ "${VERIFY_PASS}" != "true" ]; then
+            exit 1
+          fi
+          echo "✅ 所有文件部署验证通过"
+
+      # --------------------------------------------------
+      # 步骤 8：提交并推送变更
+      # --------------------------------------------------
+      - name: 📝 提交并推送更新
+        if: steps.check_version.outputs.need_update == 'true'
+        id: commit
+        run: |
+          TAG="${{ steps.get_version.outputs.tag }}"
+          
+          # 获取北京时间（UTC+8）
+          BEIJING_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+          
+          echo "当前北京时间：${BEIJING_TIME}"
+          
+          # 先回到工作目录根（防止路径漂移）
+          cd "${GITHUB_WORKSPACE}"
+          
+          # 检查是否有变更
+          git add -A
+          if git diff --cached --quiet; then
+            echo "ℹ️ 无文件变更，跳过提交"
+            echo "has_change=false" >> "$GITHUB_OUTPUT"
+          else
+            # 提交信息携带版本号和北京时间（全中文）
+            COMMIT_MSG="🔄 同步 Tailscale v${TAG} | ${BEIJING_TIME}(北京时间)"
+            
+            echo "提交信息：${COMMIT_MSG}"
+            git commit -m "${COMMIT_MSG}"
+            git push
+            echo "✅ 代码推送成功"
+            echo "has_change=true" >> "$GITHUB_OUTPUT"
+            echo "commit_msg=${COMMIT_MSG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --------------------------------------------------
+      # 步骤 9：最终结果汇总
+      # --------------------------------------------------
+      - name: 📊 更新结果汇总
+        if: always()
+        run: |
+          TAG="${{ steps.get_version.outputs.tag }}"
+          NEED_UPDATE="${{ steps.check_version.outputs.need_update }}"
+          HAS_CHANGE="${{ steps.commit.outputs.has_change }}"
+          
+          echo "=================================================="
+          echo "          🎉 工作流执行完成"
+          echo "=================================================="
+          echo "上游版本：v${TAG:-未知}"
+          echo "是否需要更新：$([ "${NEED_UPDATE}" = "true" ] && echo "是" || echo "否（已是最新）")"
+          echo "是否有变更提交：$([ "${HAS_CHANGE}" = "true" ] && echo "是" || echo "无变更")"
+          echo "北京时间：$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "=================================================="
+          
+          if [ "${NEED_UPDATE}" = "true" ] && [ "${HAS_CHANGE}" = "true" ]; then
+            echo "✅ 已成功更新至 v${TAG}"
+          elif [ "${NEED_UPDATE}" = "true" ] && [ "${HAS_CHANGE}" != "true" ]; then
+            echo "ℹ️ 文件无变化，未提交新版本"
+          else
+            echo "✅ 当前已是最新版本 v${TAG}"
+          fi
+
+      # --------------------------------------------------
+      # 步骤 10：无论成功失败，清理临时文件
+      # --------------------------------------------------
+      - name: 🗑️ 清理临时下载文件
+        if: always()
+        run: |
+          TMP_DIR="${{ steps.download.outputs.TMP_DIR }}"
+          if [ -n "${TMP_DIR}" ] && [ -d "${TMP_DIR}" ]; then
+            rm -rf "${TMP_DIR}"
+            echo "✅ 临时下载目录已清理：${TMP_DIR}"
+          else
+            echo "ℹ️ 无临时下载目录需要清理"
+          fi
+          
+          # 清理可能残留的临时 JSON 文件
+          rm -f "${RUNNER_TEMP}/release.json" 2>/dev/null || true
+          
+          echo "✅ 所有临时文件清理完成"

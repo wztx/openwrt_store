@@ -1,0 +1,317 @@
+# ============================================================
+# 工作流名称：同步 MosDNS 到 OpenWrt 24.10 仓库
+# 功能说明：定时检查上游 sbwml/luci-app-mosdns 最新版本（含预发布版），
+#           下载并校验 ipk 包与二进制文件，按架构归档到本仓库对应目录，
+#           精确清理旧版本文件，自动提交推送。
+# 触发方式：每天北京时间 06:34 定时执行 + 手动触发（支持强制更新）
+# 并发控制：同一工作流同一时间仅允许一个实例运行，防止并发冲突
+# 使用说明：将本文件放置于仓库的 .github/workflows/ 目录下即可生效
+# ============================================================
+name: 自动更新 MosDNS IPK 软件包
+
+on:
+  schedule:
+    # UTC 时间 22:34 = 北京时间 06:34
+    - cron: '34 22 * * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        required: false
+        type: boolean
+        default: false
+
+# 并发限制：同一工作流同一时间只运行一个，不取消进行中的任务（避免文件操作中断）
+concurrency:
+  group: sync-mosdns-${{ github.ref }}
+  cancel-in-progress: false
+
+# 授予推送代码的权限
+permissions:
+  contents: write
+
+jobs:
+  sync-mosdns:
+    name: 检查并同步 MosDNS 最新版本
+    runs-on: ubuntu-latest
+    steps:
+      # ============================================================
+      # 步骤 1：检出当前仓库代码
+      # ============================================================
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ============================================================
+      # 步骤 2：获取上游最新版本号（包括预发布版，不使用 /latest 端点）
+      # ============================================================
+      - name: 查询上游最新版本
+        id: get_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "正在查询上游仓库 sbwml/luci-app-mosdns 的最新版本..."
+
+          # 调用 GitHub Releases API，per_page=1 获取最新的一个 release
+          # API 默认按 published_at/created_at 降序返回，第一个即最新版本（包括 prerelease）
+          # 不使用 /releases/latest 是因为 latest 会过滤掉 prerelease 版本
+          RESPONSE=$(curl -sSL --fail-with-body \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: Mozilla/5.0 (GitHub-Actions-Sync-MosDNS)" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/sbwml/luci-app-mosdns/releases") \
+            || { echo "::error::GitHub API 请求失败"; echo "$RESPONSE"; exit 1; }
+
+          # 解析最新版本 tag_name（API 返回的第一个 release 即为最新版本，包括 prerelease）
+          TAG_NAME=$(echo "$RESPONSE" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["tag_name"])') \
+            || { echo "::error::解析版本号失败"; exit 1; }
+
+          # 解析是否为预发布版
+          PRERELEASE=$(echo "$RESPONSE" | python3 -c 'import sys,json; print(json.load(sys.stdin)[0].get("prerelease", False))')
+
+          echo "最新版本：${TAG_NAME}（预发布版：${PRERELEASE}）"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 步骤 3：下载、解压、校验、更新各架构文件
+      # 使用 shell 脚本统一处理 x86_64 和 aarch64_generic 两个架构
+      # ============================================================
+      - name: 下载并更新各架构安装包
+        id: sync
+        env:
+          TAG: ${{ steps.get_version.outputs.tag_name }}
+          FORCE: ${{ github.event.inputs.force_update || 'false' }}
+          TMP: /tmp/mosdns_sync_work
+        run: |
+          ############################################################
+          # 工具函数
+          ############################################################
+          log()  { echo "[$(date '+%H:%M:%S')] $*"; }
+          warn() { echo "::warning::$*"; }
+          err()  { echo "::error::$*"; exit 1; }
+
+          # 初始化临时目录
+          rm -rf "$TMP"
+          mkdir -p "$TMP"
+          log "临时工作目录：$TMP"
+
+          NEED_UPDATE="false"
+
+          ############################################################
+          # 处理单个架构
+          # 参数：
+          #   $1 = 上游 tarball 中的架构名（如 x86_64、aarch64_generic）
+          #   $2 = 仓库内目标目录（如 run/x86_64/luci-app-mosdns）
+          ############################################################
+          process_arch() {
+            local SRC_ARCH="$1"
+            local DEST_DIR="$2"
+            local TARBALL="${SRC_ARCH}-openwrt-24.10.tar.gz"
+            local DL_URL="https://github.com/sbwml/luci-app-mosdns/releases/download/${TAG}/${TARBALL}"
+            local ARCH_TMP="${TMP}/${SRC_ARCH}"
+
+            log "=========================================="
+            log "处理架构：${SRC_ARCH} -> ${DEST_DIR}"
+            log "=========================================="
+
+            mkdir -p "$ARCH_TMP"
+
+            # --- 下载 tarball ---
+            log "下载：${TARBALL}"
+            local HTTP
+            HTTP=$(curl -sSL -w "%{http_code}" \
+              -H "User-Agent: Mozilla/5.0 (GitHub-Actions-Sync-MosDNS)" \
+              -o "${ARCH_TMP}/${TARBALL}" \
+              "$DL_URL") || true
+            if [ "$HTTP" != "200" ]; then
+              err "下载失败，HTTP 状态码：${HTTP}，URL：${DL_URL}"
+            fi
+            log "下载完成，大小：$(du -h "${ARCH_TMP}/${TARBALL}" | cut -f1)"
+
+            # --- 校验 tar.gz 完整性 ---
+            log "校验压缩包完整性..."
+            gzip -t "${ARCH_TMP}/${TARBALL}" || err "gzip 校验失败，压缩包可能损坏"
+            tar -tzf "${ARCH_TMP}/${TARBALL}" > /dev/null 2>&1 || err "tar 列表失败，压缩包格式异常"
+            log "压缩包校验通过"
+
+            # --- 解压 ---
+            tar -xzf "${ARCH_TMP}/${TARBALL}" -C "$ARCH_TMP"
+            log "解压完成"
+
+            # --- 查找目标文件 ---
+            # 需要提取的：geo2txt*.ipk、mosdns*.ipk、luci-app-mosdns*.ipk、luci-i18n-mosdns-zh-cn*.ipk
+            # 先 cd 到架构目录，避免路径前缀问题
+            pushd "$ARCH_TMP" > /dev/null
+
+            local FILES=()
+            local f base
+
+            # 先收集所有匹配的 ipk
+            while IFS= read -r -d '' f; do
+              base=$(basename "$f")
+              # 用精确模式匹配：
+              #   - 以 luci-app-mosdns_ 开头并以 .ipk 结尾
+              #   - 以 luci-i18n-mosdns-zh-cn_ 开头并以 .ipk 结尾
+              #   - 以 mosdns_ 开头并以 .ipk 结尾
+              #   - 以 geo2txt_ 开头并以 .ipk 结尾
+              case "$base" in
+                luci-app-mosdns_*.ipk)           FILES+=("$f") ;;
+                luci-i18n-mosdns-zh-cn_*.ipk)    FILES+=("$f") ;;
+                mosdns_*.ipk)                    FILES+=("$f") ;;
+                geo2txt_*.ipk)                   FILES+=("$f") ;;
+                *) ;;
+              esac
+            done < <(find . -maxdepth 4 -type f -print0 2>/dev/null)
+
+            if [ ${#FILES[@]} -eq 0 ]; then
+              warn "在 ${SRC_ARCH} 包中未找到任何目标文件，跳过该架构"
+              popd > /dev/null
+              return 0
+            fi
+
+            log "找到 ${#FILES[@]} 个目标文件："
+            for f in "${FILES[@]}"; do
+              log "  - $(basename "$f")"
+            done
+
+            # --- 版本对比：纯文件名对比，全部存在则跳过 ---
+            mkdir -p "${GITHUB_WORKSPACE}/${DEST_DIR}"
+            local all_exist="true"
+            if [ "$FORCE" != "true" ]; then
+              for f in "${FILES[@]}"; do
+                base=$(basename "$f")
+                if [ ! -f "${GITHUB_WORKSPACE}/${DEST_DIR}/${base}" ]; then
+                  log "文件 ${base} 在目标目录中不存在，需要更新"
+                  all_exist="false"
+                  break
+                fi
+              done
+              if [ "$all_exist" = "true" ]; then
+                log "架构 ${SRC_ARCH} 的所有目标文件均已存在，跳过"
+                popd > /dev/null
+                return 0
+              fi
+            else
+              log "强制更新模式已开启，忽略文件存在检查"
+            fi
+
+            NEED_UPDATE="true"
+
+            # --- 安全删除：精确清理本工作流放置的旧文件，禁止删除其他文件 ---
+            log "清理目标目录中的旧版本文件..."
+            # 只删除本工作流管理的四类文件/通配符
+            rm -f "${GITHUB_WORKSPACE}/${DEST_DIR}/luci-app-mosdns_"*.ipk  2>/dev/null || true
+            rm -f "${GITHUB_WORKSPACE}/${DEST_DIR}/luci-i18n-mosdns-zh-cn_"*.ipk 2>/dev/null || true
+            rm -f "${GITHUB_WORKSPACE}/${DEST_DIR}/mosdns_*.ipk" 2>/dev/null || true
+            rm -f "${GITHUB_WORKSPACE}/${DEST_DIR}/geo2txt_*.ipk" 2>/dev/null || true
+            log "旧文件清理完成"
+
+            # --- ipk 完整性校验 ---
+            log "校验 ipk 文件完整性..."
+            for f in "${FILES[@]}"; do
+              base=$(basename "$f")
+              if [[ "$base" == *.ipk ]]; then
+                # 方法 1：尝试 gzip 解压缩校验（sbwml 的包多用 tar.gz 封装的 ipk）
+                if gzip -t "$f" 2>/dev/null; then
+                  log "  ${base} gzip 校验通过"
+                  # 检查是否包含 debian-binary 和 control.tar（ipk 标准结构）
+                  if tar -tzf "$f" 2>/dev/null | grep -q "debian-binary"; then
+                    log "  ${base} ipk 结构校验通过（含 debian-binary）"
+                  else
+                    warn "${base} 未找到 debian-binary，结构可能非标准，请留意"
+                  fi
+                else
+                  # 方法 2：老式 ipk 是 ar 格式，检查 ar 魔数
+                  local magic
+                  magic=$(head -c 7 "$f" 2>/dev/null || true)
+                  if [ "$magic" = "!<arch>" ]; then
+                    log "  ${base} 为 ar 格式 ipk，校验通过"
+                  else
+                    err "${base} gzip/ar 校验均失败，文件可能损坏"
+                  fi
+                fi
+              elif [ -s "$f" ]; then
+                local sz
+                sz=$(du -h "$f" | cut -f1)
+                log "  ${base} 二进制文件非空，大小：${sz}"
+              else
+                err "${base} 文件为空或大小为 0"
+              fi
+            done
+
+            # --- 复制新文件到目标目录 ---
+            log "复制新文件到 ${DEST_DIR} ..."
+            for f in "${FILES[@]}"; do
+              base=$(basename "$f")
+              cp -f "$f" "${GITHUB_WORKSPACE}/${DEST_DIR}/${base}"
+              log "  已复制：${base}"
+            done
+
+            log "架构 ${SRC_ARCH} 处理完成"
+            popd > /dev/null
+          }
+
+          ############################################################
+          # 依次处理两个架构
+          ############################################################
+          process_arch "x86_64"          "run/x86_64/luci-app-mosdns"
+          process_arch "aarch64_generic" "run/aarch64/luci-app-mosdns"
+
+          log "=========================================="
+          log "所有架构处理完毕，NEED_UPDATE=${NEED_UPDATE}"
+          log "=========================================="
+          echo "need_update=${NEED_UPDATE}" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 步骤 4：提交并推送变更
+      # ============================================================
+      - name: 提交并推送新版本
+        if: steps.sync.outputs.need_update == 'true'
+        env:
+          TAG: ${{ steps.get_version.outputs.tag_name }}
+        run: |
+          log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+          BEIJING_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
+          log "配置 Git 用户信息..."
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          log "添加目标目录到暂存区..."
+          git add "run/x86_64/luci-app-mosdns" "run/aarch64/luci-app-mosdns" || true
+
+          if git diff --cached --quiet; then
+            log "暂存区无实质变更，跳过提交"
+            exit 0
+          fi
+
+          COMMIT_MSG="🔄自动更新 MosDNS ${TAG} | ${BEIJING_TIME}(北京时间)"
+          log "提交信息：${COMMIT_MSG}"
+          git commit -m "$COMMIT_MSG"
+
+          log "推送到仓库..."
+          git push
+          log "推送成功"
+
+      # ============================================================
+      # 步骤 5：无需更新时的提示
+      # ============================================================
+      - name: 无需更新提示
+        if: steps.sync.outputs.need_update != 'true'
+        run: |
+          echo "当前版本 ${{ steps.get_version.outputs.tag_name }} 的所有文件均已存在于本地，无需更新。"
+
+      # ============================================================
+      # 步骤 6：无论成功失败，始终清理临时文件
+      # ============================================================
+      - name: 清理临时文件
+        if: always()
+        run: |
+          echo "清理临时工作目录..."
+          rm -rf /tmp/mosdns_sync_work
+          echo "临时文件清理完成"

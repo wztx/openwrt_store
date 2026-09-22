@@ -1,0 +1,143 @@
+#=================================================
+# https://github.com/wztx/openwrt_store/
+# Description: Build RunFiles using GitHub Actions
+# Lisence: MIT
+# Author: wztx
+# Blog: lpfcdn.com
+#=================================================
+
+# 用户可利用此run单独升级最新版sing-box内核
+name: 自动构建 sing-box run 安装包
+
+on:
+  schedule:
+    - cron: "5 22 * * *"  # 北京时间早上 6 点 05
+  workflow_dispatch:
+
+# 防止定时任务与手动触发并发执行导致提交冲突
+concurrency:
+  group: sing-box-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  build:
+    name: 构建sing-box并提交到本仓库
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: 拉取存储库（获取完整历史记录）
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # 拉取完整历史，便于版本对比和回推
+
+      - name: 从上游获取最新发布标签
+        id: fetch_latest_tag
+        run: |
+          latest_tag=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases \
+          | jq -r 'sort_by(.published_at) | reverse | map(select(.prerelease==false)) | .[0].tag_name')
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+          echo "最新版本:$latest_tag"
+
+      - name: 与现有版本进行比较并决定是否跳过
+        id: check_version
+        run: |
+          X86_64_TARGET="run/x86_64/sing-box_${LATEST_TAG}_x86_64.run"
+          AARCH64_TARGET="run/aarch64/sing-box_${LATEST_TAG}_aarch64_generic.run"
+          if [ -f "$X86_64_TARGET" ] && [ -f "$AARCH64_TARGET" ]; then
+            echo "版本 ${LATEST_TAG} 已存在于仓库，跳过构建与上传。"
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "仓库中未发现 ${LATEST_TAG}，开始构建。"
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+          fi
+
+      - name: 克隆存储库
+        if: env.SKIP_BUILD != 'true'
+        run: git clone https://github.com/megastep/makeself.git
+
+      - name: 下载最新的Sing-box核心ipk
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          mkdir -p build_x86_64 build_aarch64
+          VERSION=${LATEST_TAG#v}
+          # x86_64
+          wget -O build_x86_64/sing-box_${VERSION}_openwrt_x86_64.ipk \
+            https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box_${VERSION}_openwrt_x86_64.ipk
+
+          # aarch64
+          wget -O build_aarch64/sing-box_${VERSION}_openwrt_aarch64_generic.ipk \
+            https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box_${VERSION}_openwrt_aarch64_generic.ipk
+
+      - name: 创建install.sh脚本
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cat <<EOF > build_x86_64/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "update failed。"
+              exit 1
+          fi
+          opkg install *.ipk
+          echo "sing-box core has been updated to ${LATEST_TAG}"
+          EOF
+          chmod +x build_x86_64/install.sh
+          cp build_x86_64/install.sh build_aarch64/install.sh
+
+      - name: 将sing-box目录移至makeelf
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          mv build_x86_64 makeself/
+          mv build_aarch64 makeself/
+
+      - name: 创建自解压包
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cd makeself
+          ./makeself.sh build_x86_64/ sing-box_${LATEST_TAG}_x86_64.run "by github action" ./install.sh
+          ./makeself.sh build_aarch64/ sing-box_${LATEST_TAG}_aarch64_generic.run "by github action" ./install.sh
+
+      - name: 检查文件大小
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          ls -lh makeself/sing-box_*.run
+
+      - name: 准备目录并清理旧的构建工件
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          mkdir -p run/x86_64 run/aarch64
+          # 仅删除与 sing-box 构建相关的旧版本 .run 文件，保留目录下其它所有文件
+          rm -f run/x86_64/sing-box_*.run
+          rm -f run/aarch64/sing-box_*.run
+          # 将新构建产物放入对应目录
+          mv makeself/sing-box_${LATEST_TAG}_x86_64.run run/x86_64/
+          mv makeself/sing-box_${LATEST_TAG}_aarch64_generic.run run/aarch64/
+          echo "===== x86_64 目录 ====="
+          ls -lh run/x86_64/
+          echo "===== aarch64 目录 ====="
+          ls -lh run/aarch64/
+
+      - name: 提交更新并推送更新到仓库
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BUILD_TIME=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M:%S')
+          git add run/x86_64/ run/aarch64/
+          git commit -m "🔄自动构建 sing-box ${LATEST_TAG} | ${BUILD_TIME}(北京时间)"
+          git push
+
+      - name: 清理运行缓存
+        if: always()
+        run: |
+          echo "开始清理运行缓存与临时构建文件..."
+          rm -rf makeself build_x86_64 build_aarch64 2>/dev/null || true
+          # 清理工作区内未跟踪的临时文件，保留 run/ 目录
+          git clean -fdx --exclude=run/ 2>/dev/null || true
+          echo "运行缓存清理完成。"

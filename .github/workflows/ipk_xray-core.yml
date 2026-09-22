@@ -1,0 +1,429 @@
+# ============================================================
+# 自动构建与同步 Xray-core IPK 安装包工作流
+# 功能：定时检查 Xray-core 上游最新版本，自动下载并制作 OpenWrt ipk 安装包
+# 适配环境：OpenWrt 24.10
+# 支持架构：x86_64、aarch64_generic
+# ============================================================
+
+name: 自动构建 Xray-core IPK 安装包
+
+# ----------------------------------------------------------
+# 触发方式配置
+# ----------------------------------------------------------
+on:
+  # 每天 UTC 时间 22:30（北京时间 06:30）定时触发
+  schedule:
+    - cron: '30 22 * * *'
+
+  # 手动触发，支持强制更新参数
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        required: false
+        type: boolean
+        default: false
+
+# ----------------------------------------------------------
+# 并发限制：同一时间只允许一个实例运行，避免冲突
+# ----------------------------------------------------------
+concurrency:
+  group: xray-core-sync-group
+  cancel-in-progress: false
+
+# ----------------------------------------------------------
+# 授予工作流必要的权限
+# ----------------------------------------------------------
+permissions:
+  contents: write
+
+# ----------------------------------------------------------
+# 环境变量（全局常量）
+# ----------------------------------------------------------
+env:
+  UPSTREAM_API: "https://api.github.com/repos/XTLS/Xray-core/releases"
+  USER_AGENT: "Mozilla/5.0 (compatible; XrayCoreSyncBot/1.0)"
+  TZ: "Asia/Shanghai"
+
+# ==========================================================
+# 主任务
+# ==========================================================
+jobs:
+  # --------------------------------------------------------
+  # 任务：同步并打包
+  # --------------------------------------------------------
+  sync-and-package:
+    name: 检查版本并打包
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------------------------------
+      # 第一步：检出仓库代码
+      # ----------------------------------------------------
+      - name: 检出仓库
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ----------------------------------------------------
+      # 第二步：获取上游最新版本号
+      # ----------------------------------------------------
+      - name: 获取上游最新版本
+        id: latest
+        run: |
+          echo "正在查询 Xray-core 上游最新版本（含测试版）..."
+          RESPONSE=$(curl -sL -H "Accept: application/vnd.github+json" \
+                          -H "User-Agent: ${USER_AGENT}" \
+                          "${UPSTREAM_API}")
+          # 从 releases 列表中取第一条（GitHub API 默认按发布时间倒序，
+          # 第一条即为最新版本，含预发布/测试版）
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            echo "::error::获取上游版本失败！"
+            echo "API 返回: $RESPONSE"
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          echo "上游最新版本: $TAG_NAME (纯版本号: $VERSION)"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------
+      # 第三步：读取手动触发参数
+      # ----------------------------------------------------
+      - name: 读取触发参数
+        id: params
+        run: |
+          FORCE="${{ github.event.inputs.force_update }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "检测到【强制更新】开关已开启！"
+          else
+            echo "正常模式：将进行版本对比。"
+          fi
+          echo "force=$FORCE" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------
+      # 第四步：版本对比 —— 检查是否需要更新
+      # ----------------------------------------------------
+      - name: 版本对比检查
+        id: check
+        run: |
+          VERSION="${{ steps.latest.outputs.version }}"
+          FORCE="${{ steps.params.outputs.force }}"
+
+          # 期望生成的 ipk 文件名
+          IPK_X86="xray-core_${VERSION}-1_x86_64.ipk"
+          IPK_AARCH64="xray-core_${VERSION}-1_aarch64.ipk"
+
+          echo "期望的 ipk 文件名："
+          echo "  x86_64       -> run/x86_64/xray-core/$IPK_X86"
+          echo "  aarch64      -> run/aarch64/xray-core/$IPK_AARCH64"
+
+          NEED_UPDATE="true"
+          if [ "$FORCE" != "true" ]; then
+            if [ -f "run/x86_64/xray-core/$IPK_X86" ] && [ -f "run/aarch64/xray-core/$IPK_AARCH64" ]; then
+              echo "::notice::两个架构的 ipk 文件均已存在，跳过本次更新。"
+              NEED_UPDATE="false"
+            else
+              echo "发现新版本或文件缺失，需要执行打包。"
+              if [ ! -f "run/x86_64/xray-core/$IPK_X86" ]; then
+                echo "   - 缺少 x86_64 包"
+              fi
+              if [ ! -f "run/aarch64/xray-core/$IPK_AARCH64" ]; then
+                echo "   - 缺少 aarch64 包"
+              fi
+            fi
+          else
+            echo "强制更新模式：忽略文件存在检查，重新打包。"
+          fi
+
+          echo "need_update=$NEED_UPDATE" >> "$GITHUB_OUTPUT"
+          echo "ipk_x86=$IPK_X86" >> "$GITHUB_OUTPUT"
+          echo "ipk_aarch64=$IPK_AARCH64" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------
+      # 第五步：下载、解压、打包（需要更新时执行）
+      # ----------------------------------------------------
+      - name: 下载并打包 IPK
+        id: build
+        if: steps.check.outputs.need_update == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.latest.outputs.version }}"
+          TAG_NAME="${{ steps.latest.outputs.tag_name }}"
+          IPK_X86="${{ steps.check.outputs.ipk_x86 }}"
+          IPK_AARCH64="${{ steps.check.outputs.ipk_aarch64 }}"
+
+          # 创建临时工作目录
+          TMPDIR=$(mktemp -d)
+          trap 'echo "清理临时文件..."; rm -rf "$TMPDIR"; echo "临时文件已清理"' EXIT
+          echo "临时工作目录: $TMPDIR"
+
+          # 下载地址
+          DL_BASE="https://github.com/XTLS/Xray-core/releases/download/${TAG_NAME}"
+          X86_ZIP="Xray-linux-64.zip"
+          AARCH64_ZIP="Xray-linux-arm64-v8a.zip"
+
+          # ---------- 下载文件 ----------
+          echo "正在下载 Xray-core ${TAG_NAME} 二进制包..."
+
+          curl -fSL --retry 3 -H "User-Agent: ${USER_AGENT}" \
+               -o "$TMPDIR/$X86_ZIP" \
+               "$DL_BASE/$X86_ZIP"
+          echo "x86_64 下载完成"
+
+          curl -fSL --retry 3 -H "User-Agent: ${USER_AGENT}" \
+               -o "$TMPDIR/$AARCH64_ZIP" \
+               "$DL_BASE/$AARCH64_ZIP"
+          echo "aarch64 下载完成"
+
+          # ---------- 打包函数 ----------
+          build_ipk() {
+            local ARCH_OPENWRT="$1"
+            local ARCH_DIR="$2"
+            local ZIP_FILE="$3"
+            local IPK_NAME="$4"
+
+            echo ""
+            echo "===== 正在打包 ${ARCH_OPENWRT} 架构的 ipk ====="
+
+            local PKG_DIR="$TMPDIR/pkg_${ARCH_OPENWRT}"
+            mkdir -p "$PKG_DIR/control" "$PKG_DIR/data/usr/bin"
+
+            # 解压 zip，只取 xray 二进制
+            unzip -o "$TMPDIR/$ZIP_FILE" -d "$TMPDIR/unzip_${ARCH_OPENWRT}"
+            if [ ! -f "$TMPDIR/unzip_${ARCH_OPENWRT}/xray" ]; then
+              echo "::error::解压后未找到 xray 二进制文件！"
+              ls -la "$TMPDIR/unzip_${ARCH_OPENWRT}/"
+              exit 1
+            fi
+
+            # 复制二进制到 data 目录
+            cp "$TMPDIR/unzip_${ARCH_OPENWRT}/xray" "$PKG_DIR/data/usr/bin/xray"
+            chmod 0755 "$PKG_DIR/data/usr/bin/xray"
+            echo "已提取二进制文件: usr/bin/xray"
+
+            # 写入 debian-binary
+            printf '2.0\n' > "$PKG_DIR/debian-binary"
+
+            # 写入 control 文件（用 printf 避免 heredoc 的 YAML 解析问题）
+            {
+              printf 'Package: xray-core\n'
+              printf 'Version: %s-1\n' "$VERSION"
+              printf 'Depends: libc\n'
+              printf 'Architecture: %s\n' "$ARCH_OPENWRT"
+              printf 'Maintainer: github-actions\n'
+              printf 'Section: net\n'
+              printf 'Priority: optional\n'
+              printf 'Description: Xray-core is a platform for building proxies to bypass network restrictions.\n'
+              printf ' It supports multiple protocols including VLESS, VMess, Trojan, Shadowsocks, and XTLS.\n'
+            } > "$PKG_DIR/control/control"
+
+            # 写入 postinst 脚本
+            {
+              printf '#!/bin/sh\n'
+              printf '[ -n "$IPKG_INSTROOT" ] || {\n'
+              printf '  chmod 0755 /usr/bin/xray 2>/dev/null || true\n'
+              printf '}\n'
+              printf 'exit 0\n'
+            } > "$PKG_DIR/control/postinst"
+            chmod 0755 "$PKG_DIR/control/postinst"
+
+            # 打包 control.tar.gz
+            (cd "$PKG_DIR/control" && tar czf "$PKG_DIR/control.tar.gz" control postinst)
+
+            # 打包 data.tar.gz
+            (cd "$PKG_DIR/data" && tar czf "$PKG_DIR/data.tar.gz" usr/bin/xray)
+
+            # 确保目标目录存在
+            mkdir -p "${GITHUB_WORKSPACE}/run/${ARCH_DIR}/xray-core"
+
+            # 打包 ipk（ar 归档）
+            (cd "$PKG_DIR" && ar rcs "${GITHUB_WORKSPACE}/run/${ARCH_DIR}/xray-core/${IPK_NAME}" \
+              debian-binary control.tar.gz data.tar.gz)
+
+            echo "${ARCH_OPENWRT} 包已生成: run/${ARCH_DIR}/xray-core/${IPK_NAME}"
+          }
+
+          # ---------- 分别构建两个架构 ----------
+          build_ipk "x86_64"         "x86_64"    "$X86_ZIP"     "$IPK_X86"
+          build_ipk "aarch64"        "aarch64"   "$AARCH64_ZIP" "$IPK_AARCH64"
+
+          echo "build_success=true" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------
+      # 第六步：清理旧版本文件（本工作流产生的）
+      # ----------------------------------------------------
+      - name: 清理旧版本文件
+        if: steps.check.outputs.need_update == 'true' && steps.build.outputs.build_success == 'true'
+        run: |
+          VERSION="${{ steps.latest.outputs.version }}"
+          echo "正在清理 run/ 目录下 xray-core 的旧版本文件..."
+
+          # 仅清理 x86_64 和 aarch64 目录下 xray-core 的旧 ipk，不碰其他文件
+          for ARCH_DIR in "x86_64" "aarch64"; do
+            TARGET_DIR="run/${ARCH_DIR}/xray-core"
+            if [ -d "$TARGET_DIR" ]; then
+              for f in "$TARGET_DIR"/xray-core_*.ipk; do
+                [ -f "$f" ] || continue
+                BASENAME=$(basename "$f")
+                if echo "$BASENAME" | grep -q "_${VERSION}-1_"; then
+                  echo "  保留当前版本: $BASENAME"
+                else
+                  echo "  删除旧版本: $BASENAME"
+                  rm -f "$f"
+                fi
+              done
+            fi
+          done
+          echo "旧版本清理完成"
+
+      # ----------------------------------------------------
+      # 第七步：IPK 完整性校验
+      # ----------------------------------------------------
+      - name: 校验 IPK 完整性
+        if: steps.check.outputs.need_update == 'true' && steps.build.outputs.build_success == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.latest.outputs.version }}"
+          IPK_X86="${{ steps.check.outputs.ipk_x86 }}"
+          IPK_AARCH64="${{ steps.check.outputs.ipk_aarch64 }}"
+
+          echo "正在校验生成的 IPK 文件..."
+          FAILED=0
+
+          verify_ipk() {
+            local IPK_PATH="$1"
+            echo ""
+            echo "校验: $IPK_PATH"
+            if [ ! -f "$IPK_PATH" ]; then
+              echo "  [FAIL] 文件不存在！"
+              return 1
+            fi
+
+            # 检查文件大小
+            local SIZE
+            SIZE=$(stat -c%s "$IPK_PATH")
+            echo "  文件大小: $SIZE 字节"
+            if [ "$SIZE" -lt 1000000 ]; then
+              echo "  [FAIL] 文件大小异常（< 1MB），可能打包失败！"
+              return 1
+            fi
+
+            # 用 ar 检查归档完整性
+            if ! ar t "$IPK_PATH" > /dev/null 2>&1; then
+              echo "  [FAIL] 不是有效的 ar 归档（ipk 格式错误）！"
+              return 1
+            fi
+
+            # 验证包含三个必要组件
+            local AR_CONTENTS
+            AR_CONTENTS=$(ar t "$IPK_PATH")
+            for COMP in debian-binary control.tar.gz data.tar.gz; do
+              if ! echo "$AR_CONTENTS" | grep -q "^${COMP}$"; then
+                echo "  [FAIL] 缺少组件: $COMP"
+                return 1
+              fi
+            done
+
+            # 验证 debian-binary 内容
+            local VDIR
+            VDIR=$(mktemp -d)
+            (cd "$VDIR" && ar x "${GITHUB_WORKSPACE}/${IPK_PATH}" debian-binary)
+            local DB_VER
+            DB_VER=$(cat "$VDIR/debian-binary")
+            rm -rf "$VDIR"
+            if [ "$DB_VER" != "2.0" ]; then
+              echo "  [FAIL] debian-binary 版本不正确: $DB_VER"
+              return 1
+            fi
+
+            # 验证 xray 二进制存在于 data.tar.gz 中
+            local VDIR2
+            VDIR2=$(mktemp -d)
+            (cd "$VDIR2" && ar x "${GITHUB_WORKSPACE}/${IPK_PATH}" data.tar.gz)
+            if tar tzf "$VDIR2/data.tar.gz" | grep -q "usr/bin/xray"; then
+              echo "  [PASS] 包含 xray-core 二进制"
+            else
+              rm -rf "$VDIR2"
+              echo "  [FAIL] data.tar.gz 中未找到 xray-core！"
+              return 1
+            fi
+            rm -rf "$VDIR2"
+
+            echo "  [PASS] 校验通过"
+            return 0
+          }
+
+          verify_ipk "run/x86_64/xray-core/$IPK_X86"       || FAILED=1
+          verify_ipk "run/aarch64/xray-core/$IPK_AARCH64" || FAILED=1
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::error::IPK 校验失败！请检查打包过程。"
+            exit 1
+          fi
+          echo ""
+          echo "=========================================="
+          echo "所有 IPK 文件校验通过！"
+          echo "=========================================="
+
+      # ----------------------------------------------------
+      # 第八步：提交并推送到仓库
+      # ----------------------------------------------------
+      - name: 提交变更到仓库
+        if: steps.check.outputs.need_update == 'true' && steps.build.outputs.build_success == 'true'
+        run: |
+          VERSION="${{ steps.latest.outputs.version }}"
+          BEIJING_TIME=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M:%S")
+
+          echo "配置 Git 用户信息..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "查看变更状态..."
+          git status
+
+          git add run/x86_64/xray-core/ run/aarch64/xray-core/
+
+          if git diff --cached --quiet; then
+            echo "没有文件变更需要提交。"
+          else
+            echo "正在提交..."
+            COMMIT_MSG="🔄自动构建 Xray-core v${VERSION} | ${BEIJING_TIME} (北京时间)"
+            COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"自动检测上游新版本并打包，x86_64/aarch64双架构支持，适配OpenWrt 24.10。"
+            git commit -m "$COMMIT_MSG"
+            echo "正在推送..."
+            git push
+            echo "推送成功！"
+          fi
+
+      # ----------------------------------------------------
+      # 第九步：输出总结（always 执行）
+      # ----------------------------------------------------
+      - name: 执行总结
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "          工作流执行总结"
+          echo "=========================================="
+          echo "上游版本: ${{ steps.latest.outputs.tag_name }}"
+          echo "是否需要更新: ${{ steps.check.outputs.need_update }}"
+          echo "强制更新: ${{ steps.params.outputs.force }}"
+          if [ "${{ steps.check.outputs.need_update }}" = "true" ]; then
+            if [ "${{ steps.build.outputs.build_success }}" = "true" ]; then
+              echo "打包状态: 成功"
+              echo "生成文件:"
+              echo "  - run/x86_64/xray-core/${{ steps.check.outputs.ipk_x86 }}"
+              echo "  - run/aarch64/xray-core/${{ steps.check.outputs.ipk_aarch64 }}"
+            else
+              echo "打包状态: 失败或未执行"
+            fi
+          else
+            echo "结果: 已是最新版本，无需更新。"
+          fi
+          echo "=========================================="

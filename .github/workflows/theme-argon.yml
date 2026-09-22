@@ -1,0 +1,329 @@
+name: 自动更新 Argon IPK 主题包
+
+on:
+  schedule:
+    - cron: '19 22 * * *'	# 每天定时自动运行（北京时间 06:19 对应 UTC 22:19）
+  workflow_dispatch:
+    # 允许手动触发
+    inputs:
+      force_update:
+        description: '强制更新（忽略版本对比）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+concurrency:	# 防止定时任务与手动触发并发执行导致提交冲突
+  group: argon-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  update-argon:
+    name: 同步Argon主题软件包
+    runs-on: ubuntu-latest
+
+    env:
+      TZ: Asia/Shanghai
+      GITHUB_REPO: jerrykuku/luci-theme-argon
+      OPENWRT_VER: '24.10.6'
+      MIRROR_BASE: https://mirrors.vsean.net/openwrt/releases
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0	# 需要完整历史以对比版本
+
+      - name: 设置北京时区
+        run: |
+          sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo "BEIJING_DATE=$(date '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "BEIJING_TIME=$(date '+%H:%M:%S')" >> "$GITHUB_ENV"
+          echo "北京时间已设置: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      # ---------------------------------------------------------------
+      # 关键：每个 run 步骤开头都显式 cd 到 GITHUB_WORKSPACE，防止
+      # 上一个步骤的 cd 导致工作目录漂移（GitHub Actions 每个 run
+      # 步骤是独立 shell，但使用 actions/checkout 后的默认 cwd 是仓库根，
+      # 加上显式 cd 可彻底避免子 shell 残留目录的隐患）
+      # ---------------------------------------------------------------
+
+      - name: 获取 GitHub 最新版本号
+        id: get_version
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          # 使用 GitHub API 获取最新 release tag（ubuntu-latest 自带 jq）
+          RESP=$(curl -sSL --connect-timeout 15 -m 30 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")
+          LATEST_VER=$(echo "${RESP}" | jq -r '.tag_name' | sed 's/^v//')
+          if [ -z "${LATEST_VER}" ] || [ "${LATEST_VER}" = "null" ]; then
+            echo "::error::无法从 GitHub API 获取 ${GITHUB_REPO} 的最新版本号"
+            echo "API 响应: ${RESP:0:500}"
+            exit 1
+          fi
+          echo "latest_ver=${LATEST_VER}" >> "$GITHUB_OUTPUT"
+          echo "GitHub 最新版本: ${LATEST_VER}"
+
+      - name: 创建目标目录
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p run/x86_64/luci-app-argon
+          mkdir -p run/aarch64/luci-app-argon
+          echo "目标目录已就绪:"
+          ls -ld run/x86_64/luci-app-argon run/aarch64/luci-app-argon
+
+      - name: 获取中文语言包文件名（x86_64 源）
+        id: get_i18n
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          IDX_URL="${MIRROR_BASE}/${OPENWRT_VER}/packages/x86_64/luci/"
+          echo "正在从镜像索引获取中文包文件名: ${IDX_URL}"
+          IDX_HTML=$(curl -sSL --connect-timeout 15 -m 30 "${IDX_URL}")
+          # 中文包是 all 架构通用包，x86_64 目录里就有
+          I18N_FILE=$(echo "${IDX_HTML}" | grep -oE 'luci-i18n-argon-config-zh-cn_[^"<>]*_all\.ipk' | head -n1)
+          if [ -z "${I18N_FILE}" ]; then
+            echo "::error::无法从索引页解析到中文包文件名"
+            echo "索引页前 1000 字符: ${IDX_HTML:0:1000}"
+            exit 1
+          fi
+          I18N_VER=$(echo "${I18N_FILE}" | sed -n 's/luci-i18n-argon-config-zh-cn_\(.*\)_all\.ipk/\1/p')
+          echo "i18n_file=${I18N_FILE}" >> "$GITHUB_OUTPUT"
+          echo "i18n_ver=${I18N_VER}" >> "$GITHUB_OUTPUT"
+          echo "中文包: ${I18N_FILE}"
+          echo "中文包版本: ${I18N_VER}"
+
+      - name: 按文件名进行版本对比
+        id: check
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          LATEST_VER="${{ steps.get_version.outputs.latest_ver }}"
+          I18N_FILE="${{ steps.get_i18n.outputs.i18n_file }}"
+          FORCE="${{ github.event.inputs.force_update || 'false' }}"
+
+          NEW_APP="luci-app-argon-config_${LATEST_VER}_all.ipk"
+          NEW_THEME="luci-theme-argon_${LATEST_VER}_all.ipk"
+          NEW_I18N="${I18N_FILE}"
+
+          echo "new_app=${NEW_APP}" >> "$GITHUB_OUTPUT"
+          echo "new_theme=${NEW_THEME}" >> "$GITHUB_OUTPUT"
+          echo "new_i18n=${NEW_I18N}" >> "$GITHUB_OUTPUT"
+
+          echo "期望的新文件:"
+          echo "  - ${NEW_APP}"
+          echo "  - ${NEW_THEME}"
+          echo "  - ${NEW_I18N}"
+
+          NEED_UPDATE="false"
+
+          # 用 shell 数组避免多行字符串遍历错误（不依赖环境变量的跨 shell 多行拆分）
+          DIRS=(
+            "run/x86_64/luci-app-argon"
+            "run/aarch64/luci-app-argon"
+          )
+
+          for DIR in "${DIRS[@]}"; do
+            cd "${GITHUB_WORKSPACE}"
+            if [ ! -d "${DIR}" ]; then
+              echo "[${DIR}] 目录不存在 -> 需要更新"
+              NEED_UPDATE="true"
+              continue
+            fi
+            MISSING=""
+            for f in "${NEW_APP}" "${NEW_THEME}" "${NEW_I18N}"; do
+              if [ ! -f "${DIR}/${f}" ]; then
+                MISSING="${MISSING} ${f}"
+              fi
+            done
+            if [ -n "${MISSING}" ]; then
+              echo "[${DIR}] 缺少:${MISSING} -> 需要更新"
+              NEED_UPDATE="true"
+            else
+              echo "[${DIR}] 三个文件均已是最新 -> 无变化"
+            fi
+          done
+
+          if [ "${FORCE}" = "true" ]; then
+            echo "收到手动强制更新指令"
+            NEED_UPDATE="true"
+          fi
+
+          echo "need_update=${NEED_UPDATE}" >> "$GITHUB_OUTPUT"
+          if [ "${NEED_UPDATE}" = "true" ]; then
+            echo "NEED_UPDATE=1" >> "$GITHUB_ENV"
+            echo "结论: 需要更新"
+          else
+            echo "NEED_UPDATE=0" >> "$GITHUB_ENV"
+            echo "结论: 所有目录均已是最新版本，跳过本次构建"
+          fi
+
+      - name: 下载 GitHub 软件包（luci-app-argon-config、luci-theme-argon）
+        if: env.NEED_UPDATE == '1'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          LATEST_VER="${{ steps.get_version.outputs.latest_ver }}"
+          NEW_APP="${{ steps.check.outputs.new_app }}"
+          NEW_THEME="${{ steps.check.outputs.new_theme }}"
+
+          DL_BASE="https://github.com/${GITHUB_REPO}/releases/download/v${LATEST_VER}"
+          mkdir -p /tmp/argon-dl
+          cd /tmp/argon-dl
+
+          echo ">>> 下载 ${NEW_APP}"
+          curl -fSL --connect-timeout 15 -m 120 --retry 2 -o "${NEW_APP}" "${DL_BASE}/${NEW_APP}"
+          echo ">>> 下载 ${NEW_THEME}"
+          curl -fSL --connect-timeout 15 -m 120 --retry 2 -o "${NEW_THEME}" "${DL_BASE}/${NEW_THEME}"
+
+          echo ""
+          echo "下载完成:"
+          ls -lh /tmp/argon-dl/
+
+          # 校验文件大小（<1KB 视为下载到错误页）
+          for f in "${NEW_APP}" "${NEW_THEME}"; do
+            SIZE=$(stat -c%s "${f}")
+            if [ "${SIZE}" -lt 1024 ]; then
+              echo "::error::${f} 文件过小 (${SIZE} bytes)，可能是 404 错误页面"
+              exit 1
+            fi
+          done
+
+      - name: 下载中文语言包
+        if: env.NEED_UPDATE == '1'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          I18N_FILE="${{ steps.get_i18n.outputs.i18n_file }}"
+          I18N_URL="${MIRROR_BASE}/${OPENWRT_VER}/packages/x86_64/luci/${I18N_FILE}"
+
+          cd /tmp/argon-dl
+          echo ">>> 下载中文包 ${I18N_FILE}"
+          curl -fSL --connect-timeout 15 -m 120 --retry 2 -o "${I18N_FILE}" "${I18N_URL}"
+
+          echo ""
+          ls -lh /tmp/argon-dl/
+          SIZE=$(stat -c%s "${I18N_FILE}")
+          if [ "${SIZE}" -lt 200 ]; then
+            echo "::error::中文包 ${I18N_FILE} 文件过小 (${SIZE} bytes)"
+            exit 1
+          fi
+
+      - name: 部署文件到各架构目录并清理对应旧版本
+        if: env.NEED_UPDATE == '1'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          NEW_APP="${{ steps.check.outputs.new_app }}"
+          NEW_THEME="${{ steps.check.outputs.new_theme }}"
+          NEW_I18N="${{ steps.check.outputs.new_i18n }}"
+
+          # 注意：中文包是 all 架构，同一个文件需要放到两个架构目录下
+          DIRS=(
+            "run/x86_64/luci-app-argon"
+            "run/aarch64/luci-app-argon"
+          )
+
+          for DIR in "${DIRS[@]}"; do
+            echo ""
+            echo "===== 处理目录: ${DIR} ====="
+            cd "${GITHUB_WORKSPACE}"
+            mkdir -p "${DIR}"
+            cd "${DIR}"
+
+            # 仅删除与本次构建相关的旧版本（三个前缀），绝对不动其它 .ipk 或其它文件
+            # 安全做法：逐个前缀，先找出来打印，再删除
+            for PREFIX in luci-app-argon-config luci-theme-argon luci-i18n-argon-config-zh-cn; do
+              echo "--- 清理 ${PREFIX} 旧版本（保留最新文件名）---"
+              # 列出将被删除的旧文件
+              find . -maxdepth 1 -type f -name "${PREFIX}_*.ipk" \
+                ! -name "${NEW_APP}" ! -name "${NEW_THEME}" ! -name "${NEW_I18N}" \
+                -print -delete || true
+            done
+
+            # 复制新文件（强制覆盖）
+            cd "${GITHUB_WORKSPACE}"
+            install -m 644 "/tmp/argon-dl/${NEW_APP}"   "${DIR}/"
+            install -m 644 "/tmp/argon-dl/${NEW_THEME}" "${DIR}/"
+            install -m 644 "/tmp/argon-dl/${NEW_I18N}"  "${DIR}/"
+
+            echo "[${DIR}] 更新后文件列表:"
+            ls -lh "${DIR}/"
+          done
+
+      - name: 提交并推送变更
+        if: env.NEED_UPDATE == '1'
+        run: |
+          set -euo pipefail
+          LATEST_VER="${{ steps.get_version.outputs.latest_ver }}"
+          I18N_VER="${{ steps.get_i18n.outputs.i18n_ver }}"
+
+          # 始终回到仓库根目录，避免工作目录漂移
+          cd "${GITHUB_WORKSPACE}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add run/x86_64/luci-app-argon/ run/aarch64/luci-app-argon/
+
+          if git diff --cached --quiet; then
+            echo "文件内容无实质差异，跳过提交"
+            echo "ACTUALLY_UPDATED=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "ACTUALLY_UPDATED=1" >> "$GITHUB_ENV"
+
+          # 提交信息中自动携带版本号与北京时间
+          COMMIT_BODY=$(printf \
+            "🔄自动更新: Argon v%s | zh-cn %s\n\n- luci-app-argon-config: %s\n- luci-theme-argon: %s\n- luci-i18n-argon-config-zh-cn: %s\n\n北京时间: %s %s" \
+            "${LATEST_VER}" "${I18N_VER}" \
+            "${LATEST_VER}" "${LATEST_VER}" "${I18N_VER}" \
+            "${{ env.BEIJING_DATE }}" "${{ env.BEIJING_TIME }}")
+
+          git commit -m "${COMMIT_BODY}"
+          git push origin HEAD
+          echo "已成功推送提交: ${COMMIT_BODY}"
+
+      - name: 清理运行缓存与临时文件
+        if: always()
+        run: |
+          set +eu
+          cd "${GITHUB_WORKSPACE}"
+          echo ">>> 清理下载临时目录 /tmp/argon-dl"
+          rm -rf /tmp/argon-dl
+          echo ">>> 清理 npm/pip/runner 临时缓存（仅与本次构建相关的路径）"
+          rm -rf "${RUNNER_TEMP:-/tmp}/argon-"* 2>/dev/null || true
+          echo ">>> 磁盘占用情况:"
+          df -h . || true
+          echo "缓存清理完成"
+
+      - name: 构建结果汇总
+        if: always()
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          echo ""
+          echo "==================== 构建结果 ===================="
+          echo "北京时间        : ${{ env.BEIJING_DATE }} ${{ env.BEIJING_TIME }}"
+          echo "GitHub 主题版本 : ${{ steps.get_version.outputs.latest_ver }}"
+          echo "中文包版本      : ${{ steps.get_i18n.outputs.i18n_ver }}"
+          echo "需要更新        : ${{ env.NEED_UPDATE }}"
+          echo "实际推送        : ${{ env.ACTUALLY_UPDATED }}"
+          echo ""
+          echo "----- run/x86_64/luci-app-argon -----"
+          ls -lh run/x86_64/luci-app-argon/ 2>/dev/null || echo "目录不存在"
+          echo ""
+          echo "----- run/aarch64/luci-app-argon -----"
+          ls -lh run/aarch64/luci-app-argon/ 2>/dev/null || echo "目录不存在"
+          echo "=================================================="

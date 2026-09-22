@@ -1,0 +1,311 @@
+# =============================================================================
+# 工作流名称：同步 luci-app-taskplan 上游最新版本
+# 功能说明：每天定时 / 手动触发，从 sirpdboy/luci-app-taskplan Releases 拉取
+#           openwrt-24.10 的 x86_64 与 aarch64_generic 包，解压出全部 ipk，
+#           按架构分发到本仓库对应目录，并清理本工作流产生的旧版本文件。
+# 使用环境：OpenWrt 24.10
+# =============================================================================
+
+name: 自动更新 luci-app-taskplan IPK 软件包
+
+on:
+  # ---- 定时触发：每天北京时间 06:21 执行（GitHub 原生 schedule 为 UTC，UTC+8=北京时间）----
+  schedule:
+    - cron: '21 22 * * *'    # UTC 22:21 = 北京时间次日 06:21
+      timezone: 'Asia/Shanghai'
+
+  # ---- 手动触发：支持一键强制更新 ----
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制更新（忽略本地版本对比，强制覆盖）'
+        required: false
+        type: boolean
+        default: false
+
+# ---- 并发限制：同一分支同一工作流同一时间只运行一个，旧运行自动取消 ----
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---- 工作权限：需要推送代码到本仓库 ----
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: 同步上游版本
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: 'sirpdboy/luci-app-taskplan'
+      OPENWRT_VER: '24.10'
+      UA: 'GitHub-Actions-Sync-Bot/1.0 (+https://github.com/${{ github.repository }})'
+      TMP_DIR: '${{ github.workspace }}/.tmp_sync'
+      # 架构与目标目录映射：<release资产中的arch后缀>=<本地存放目录>
+      ARCH_X86:    'x86_64'
+      ARCH_ARM64:  'aarch64_generic'
+      DEST_X86:    'run/x86_64/luci-app-taskplan'
+      DEST_ARM64:  'run/aarch64/luci-app-taskplan'
+
+    steps:
+      # ============================================================
+      # 步骤 0：检出本仓库代码
+      # ============================================================
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0    # 拉取完整历史，避免推送时 ref 不全
+
+      # ============================================================
+      # 步骤 1：初始化临时目录、设置北京时间变量、配置 Git 身份
+      # ============================================================
+      - name: 初始化运行环境
+        id: init
+        run: |
+          set -euo pipefail
+          # 创建临时工作目录（位于 workspace 内，避免目录漂移污染系统目录）
+          rm -rf "$TMP_DIR"
+          mkdir -p "$TMP_DIR"
+          # 北京时间
+          BJ_TIME="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "BJ_TIME=${BJ_TIME}" >> "$GITHUB_ENV"
+          echo "BJ_DATE=$(TZ='Asia/Shanghai' date '+%Y%m%d%H%M%S')" >> "$GITHUB_ENV"
+          echo "FORCE_UPDATE=${{ github.event.inputs.force || 'false' }}" >> "$GITHUB_ENV"
+          # Git 身份
+          git config --global user.name  'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      # ============================================================
+      # 步骤 2：获取上游最新版本（包含预发布版，跳过 draft；不使用 /latest）
+      # ============================================================
+      - name: 获取上游最新版本信息
+        id: latest
+        run: |
+          set -euo pipefail
+          RESP="$TMP_DIR/releases.json"
+          echo "[获取版本] 正在请求 GitHub API ..."
+          curl -fsSL \
+            --retry 3 --retry-delay 2 \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: ${UA}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=20" \
+            -o "$RESP"
+          # 取第一个非 draft 的 release（API 按 published_at 倒序返回，即最新版本，含 prerelease）
+          TAG="$(python3 -c '
+          import json,sys
+          data=json.load(open(sys.argv[1]))
+          for r in data:
+              if not r.get("draft",False):
+                  print(r["tag_name"]); sys.exit(0)
+          sys.exit("未找到可用的 release")
+          ' "$RESP")"
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "[获取版本] 最新版本标签: ${TAG}"
+
+          # 解析出两个目标资产的下载 URL
+          URL_X86="$(python3 -c '
+          import json,sys
+          data=json.load(open(sys.argv[1]))
+          tag=sys.argv[2]; arch=sys.argv[3]; ver=sys.argv[4]
+          target=f"openwrt-{ver}-{arch}.tar.gz"
+          for r in data:
+              if r.get("tag_name")!=tag or r.get("draft"): continue
+              for a in r.get("assets",[]):
+                  if a["name"]==target:
+                      print(a["browser_download_url"]); sys.exit(0)
+          sys.exit(f"未找到资产 {target}")
+          ' "$RESP" "$TAG" "$ARCH_X86" "$OPENWRT_VER")"
+          URL_ARM64="$(python3 -c '
+          import json,sys
+          data=json.load(open(sys.argv[1]))
+          tag=sys.argv[2]; arch=sys.argv[3]; ver=sys.argv[4]
+          target=f"openwrt-{ver}-{arch}.tar.gz"
+          for r in data:
+              if r.get("tag_name")!=tag or r.get("draft"): continue
+              for a in r.get("assets",[]):
+                  if a["name"]==target:
+                      print(a["browser_download_url"]); sys.exit(0)
+          sys.exit(f"未找到资产 {target}")
+          ' "$RESP" "$TAG" "$ARCH_ARM64" "$OPENWRT_VER")"
+          echo "URL_X86=${URL_X86}"    >> "$GITHUB_OUTPUT"
+          echo "URL_ARM64=${URL_ARM64}" >> "$GITHUB_OUTPUT"
+          echo "[获取版本] x86_64    下载地址: ${URL_X86}"
+          echo "[获取版本] aarch64_generic 下载地址: ${URL_ARM64}"
+
+      # ============================================================
+      # 步骤 3：下载并解压两个架构的 tar.gz 包
+      # ============================================================
+      - name: 下载上游发行包
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMP_DIR/download" "$TMP_DIR/extract"
+          for pair in "${ARCH_X86}:${{ steps.latest.outputs.URL_X86 }}" "${ARCH_ARM64}:${{ steps.latest.outputs.URL_ARM64}}"; do
+            arch="${pair%%:*}"
+            url="${pair#*:}"
+            out="$TMP_DIR/download/${arch}.tar.gz"
+            echo "[下载] ${arch} <- ${url}"
+            curl -fSL \
+              --retry 3 --retry-delay 3 \
+              --connect-timeout 15 --max-time 300 \
+              -H "User-Agent: ${UA}" \
+              "$url" -o "$out"
+            ls -lh "$out"
+          done
+
+      - name: 解压并提取所有 ipk 文件
+        id: extract
+        run: |
+          set -euo pipefail
+          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
+            src="$TMP_DIR/download/${arch}.tar.gz"
+            dst="$TMP_DIR/extract/${arch}"
+            mkdir -p "$dst"
+            echo "[解压] ${arch} -> ${dst}"
+            # 使用 --strip-components=0 保留内部结构，避免因上游目录结构变化导致漂移
+            tar -xzf "$src" -C "$dst" --no-same-owner --no-same-permissions
+            # 收集所有 ipk 文件名（仅 basename），用于后续版本对比
+            find "$dst" -type f -name '*.ipk' -printf '%f\n' | LC_ALL=C sort -u > "$TMP_DIR/ipk_list_${arch}.txt"
+            cnt="$(wc -l < "$TMP_DIR/ipk_list_${arch}.txt" | tr -d ' ')"
+            echo "  -> 提取到 ${cnt} 个 ipk 文件:"
+            sed 's/^/      /' "$TMP_DIR/ipk_list_${arch}.txt"
+            if [ "${cnt}" -eq 0 ]; then
+              echo "[错误] ${arch} 包内未找到任何 .ipk 文件，可能上游包结构发生变化，中止。" >&2
+              exit 1
+            fi
+          done
+
+      # ============================================================
+      # 步骤 4：版本对比 —— 纯文件名对比，目标目录已全部存在则跳过
+      # ============================================================
+      - name: 版本对比（本地是否已是最新）
+        id: check
+        run: |
+          set -euo pipefail
+          NEED_UPDATE="false"
+          declare -A DEST_MAP=( ["$ARCH_X86"]="$DEST_X86" ["$ARCH_ARM64"]="$DEST_ARM64" )
+          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
+            dest="${DEST_MAP[$arch]}"
+            list="$TMP_DIR/ipk_list_${arch}.txt"
+            missing=0
+            total=0
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              total=$((total+1))
+              if [ ! -f "${GITHUB_WORKSPACE}/${dest}/${f}" ]; then
+                missing=$((missing+1))
+                echo "[对比] ${arch} 缺少文件: ${f}"
+              fi
+            done < "$list"
+            if [ "$missing" -gt 0 ]; then
+              echo "[对比] ${arch}: 共 ${total} 个文件，缺失 ${missing} 个，需要更新。"
+              NEED_UPDATE="true"
+            else
+              echo "[对比] ${arch}: 共 ${total} 个文件，本地全部存在。"
+            fi
+          done
+          if [ "${FORCE_UPDATE}" = "true" ]; then
+            echo "[对比] 已选择强制更新。"
+            NEED_UPDATE="true"
+          fi
+          echo "NEED_UPDATE=${NEED_UPDATE}" >> "$GITHUB_OUTPUT"
+          if [ "${NEED_UPDATE}" = "false" ]; then
+            echo "[对比] 所有目标文件已存在，无需更新，流程结束。"
+          fi
+
+      # ============================================================
+      # 步骤 5：清理旧版本文件（仅删除本工作流管辖的 ipk，严禁误删其他）
+      #         + 复制新 ipk 到目标目录
+      # ============================================================
+      - name: 清理旧版本并同步新文件
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          declare -A DEST_MAP=( ["$ARCH_X86"]="$DEST_X86" ["$ARCH_ARM64"]="$DEST_ARM64" )
+          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
+            dest="${DEST_MAP[$arch]}"
+            src_dir="$TMP_DIR/extract/${arch}"
+            list="$TMP_DIR/ipk_list_${arch}.txt"
+            echo "[同步] ${arch} -> ${dest}"
+            mkdir -p "$dest"
+
+            # ---- 安全清理：仅删除与本工作流明确相关的旧 ipk 文件 ----
+            # 匹配模式：luci-app-taskplan*.ipk / luci-i18n-taskplan*.ipk
+            # 使用 find -maxdepth 1 避免进入其他子目录，且仅删 .ipk
+            echo "[清理] 精确移除 ${dest} 下的旧版 luci-app-taskplan / luci-i18n-taskplan ipk ..."
+            find "$dest" -maxdepth 1 -type f \( \
+                -name 'luci-app-taskplan*.ipk' -o \
+                -name 'luci-i18n-taskplan*.ipk' \
+              \) -print -delete || true
+
+            # ---- 复制新 ipk 到目标目录（仅 .ipk 文件，保留文件名）----
+            # 用 find 递归查找解压后的 ipk 并复制（兼容上游可能的子目录结构）
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              # 在解压目录里定位该文件
+              src_path="$(find "$src_dir" -type f -name "$f" -print -quit)"
+              if [ -z "$src_path" ]; then
+                echo "[错误] 在 ${src_dir} 中找不到 ${f}"
+                exit 1
+              fi
+              cp -f "$src_path" "${dest}/${f}"
+              echo "  -> 复制 ${f}"
+            done < "$list"
+          done
+          echo "[同步] 文件同步完成。"
+
+      # ============================================================
+      # 步骤 6：提交并推送变更
+      # ============================================================
+      - name: 提交并推送到仓库
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        id: commit
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          VERSION="${{ steps.latest.outputs.VERSION }}"
+          BJ_TIME="${BJ_TIME}"
+          # 添加变更
+          git add -- "$DEST_X86" "$DEST_ARM64"
+          # 检查是否存在实际变更
+          if git diff --cached --quiet; then
+            echo "[提交] 无实质变更，跳过提交。"
+            echo "COMMITTED=false" >> "$GITHUB_OUTPUT"
+          else
+            COMMIT_MSG="🔄自动更新 luci-app-taskplan v${VERSION} |  ${BJ_TIME}(北京时间)"
+            echo "[提交] 提交信息: ${COMMIT_MSG}"
+            git commit -m "${COMMIT_MSG}"
+            git push
+            echo "COMMITTED=true" >> "$GITHUB_OUTPUT"
+            echo "[提交] 推送成功。"
+          fi
+
+      - name: 同步结果摘要
+        if: always()
+        run: |
+          NEED="${{ steps.check.outputs.NEED_UPDATE }}"
+          COMMITTED="${{ steps.commit.outputs.COMMITTED }}"
+          if [ "${NEED}" != "true" ]; then
+            echo "==> 本地已是最新版本 ${{ steps.latest.outputs.TAG }}，无需更新。"
+          elif [ "${COMMITTED}" = "true" ]; then
+            echo "==> 已成功同步并推送 v${{ steps.latest.outputs.VERSION }} 到仓库。"
+          else
+            echo "==> 文件已同步但无实质差异，未产生新提交。"
+          fi
+
+      # ============================================================
+      # 步骤 7：无论成功失败，始终清理临时文件，避免污染工作区
+      # ============================================================
+      - name: 清理临时文件
+        if: always()
+        run: |
+          if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR}" ]; then
+            echo "[清理] 删除临时目录: ${TMP_DIR}"
+            rm -rf "${TMP_DIR}"
+          fi
+          echo "[清理] 完成。"
