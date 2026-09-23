@@ -1,0 +1,287 @@
+# ============================================================
+# OpenWrt dufs 软件包同步工作流
+# 功能：从 mirrors.vsean.net 自动下载 dufs 及其 LuCI 插件，
+#       按文件名对比版本、清理旧版本、推送到当前仓库。
+# 架构：aarch64_generic、x86_64
+# 包名：dufs、luci-app-dufs、luci-i18n-dufs-zh-cn
+# ============================================================
+
+name: 自动更新 dufs IPK 软件包
+
+"on":
+  schedule:
+    - cron: '23 22 * * *'	# 每天定时自动运行（北京时间 06:23 对应 UTC 22:23）
+  workflow_dispatch:		# 支持手动触发
+
+concurrency:	# 防止定时任务与手动触发并发执行导致提交冲突
+  group: argon-repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 允许推送到本仓库
+  actions: write    # 允许清理本仓库的 Actions 运行缓存
+
+jobs:
+  sync-dufs-packages:
+    name: 同步dufs软件包
+    runs-on: ubuntu-latest
+
+    env:
+      OPENWRT_VERSION: '24.10.6'
+      MIRROR_BASE: 'https://mirrors.vsean.net/openwrt/releases/24.10.6/packages'
+      TZ: Asia/Shanghai
+
+    steps:
+      # --------------------------------------------------------
+      # 第1步：检出仓库（固定工作目录，防止目录漂移）
+      # --------------------------------------------------------
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0	# 需要完整历史以对比版本
+
+      # --------------------------------------------------------
+      # 第2步：初始化工作环境
+      # --------------------------------------------------------
+      - name: 初始化工作环境
+        id: init
+        run: |
+          set -euo pipefail
+          echo "WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/run/x86_64/luci-app-dufs"
+          mkdir -p "$GITHUB_WORKSPACE/run/aarch64/luci-app-dufs"
+          echo "工作目录初始化完成：$GITHUB_WORKSPACE"
+
+      # --------------------------------------------------------
+      # 第3步：下载并同步各架构软件包
+      # --------------------------------------------------------
+      - name: 下载并同步dufs软件包
+        id: download
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+
+          UPDATED_PKGS_FILE="/tmp/updated_pkgs.txt"
+          UPDATED_ARCHS_FILE="/tmp/updated_archs.txt"
+          : > "$UPDATED_PKGS_FILE"
+          : > "$UPDATED_ARCHS_FILE"
+          CHANGED=0
+
+          # 定义要处理的架构: "源架构名|目标相对目录"
+          ARCH_MAPPINGS=(
+            "aarch64_generic|run/aarch64/luci-app-dufs"
+            "x86_64|run/x86_64/luci-app-dufs"
+          )
+
+          for MAPPING in "${ARCH_MAPPINGS[@]}"; do
+            SRC_ARCH="${MAPPING%%|*}"
+            DEST_REL="${MAPPING#*|}"
+            DEST_DIR="$WORKDIR/$DEST_REL"
+
+            echo "=========================================="
+            echo "处理架构: $SRC_ARCH -> $DEST_REL"
+            echo "=========================================="
+            mkdir -p "$DEST_DIR"
+
+            PKG_BASE_URL="$MIRROR_BASE/$SRC_ARCH"
+
+            # 格式: "子目录|远端包名前缀|本地文件清理前缀"
+            PKG_LIST=(
+              "packages|dufs_|dufs_"
+              "luci|luci-app-dufs_|luci-app-dufs_"
+              "luci|luci-i18n-dufs-zh-cn_|luci-i18n-dufs-zh-cn_"
+            )
+
+            for ENTRY in "${PKG_LIST[@]}"; do
+              SUB_DIR="${ENTRY%%|*}"
+              REST="${ENTRY#*|}"
+              REMOTE_PREFIX="${REST%%|*}"
+              CLEAN_PREFIX="${REST#*|}"
+
+              echo ""
+              echo "--- 处理包: $REMOTE_PREFIX (来源: $SUB_DIR) ---"
+
+              INDEX_URL="$PKG_BASE_URL/$SUB_DIR/"
+
+              # 从索引页抓取最新 .ipk 文件名（最多重试3次）
+              REMOTE_NAME=""
+              for RETRY in 1 2 3; do
+                REMOTE_NAME=$(wget -qO- "$INDEX_URL" \
+                  | grep -oE 'href="'${REMOTE_PREFIX}'[^"]*[.]ipk"' \
+                  | head -n1 \
+                  | sed -E 's/href="([^"]+)"/\1/')
+                if [ -n "$REMOTE_NAME" ]; then
+                  break
+                fi
+                echo "  第${RETRY}次抓取失败，等待后重试..."
+                sleep 2
+              done
+
+              if [ -z "$REMOTE_NAME" ]; then
+                echo "::warning::未找到 $REMOTE_PREFIX 开头的 .ipk 文件（索引: $INDEX_URL）"
+                continue
+              fi
+
+              echo "远端最新版本: $REMOTE_NAME"
+              TARGET_PATH="$DEST_DIR/$REMOTE_NAME"
+
+              # ---------- 清理旧版本（无论是否需要下载，都清理同前缀的旧版 .ipk） ----------
+              OLD_FILES=$(find "$DEST_DIR" -maxdepth 1 -type f \
+                -name "${CLEAN_PREFIX}*.ipk" \
+                ! -name "$REMOTE_NAME" 2>/dev/null || true)
+              if [ -n "$OLD_FILES" ]; then
+                echo "清理该包的旧版本文件:"
+                echo "$OLD_FILES" | sed 's/^/  删除: /'
+                echo "$OLD_FILES" | xargs rm -f
+                CHANGED=1
+              fi
+
+              # ---------- 版本对比（仅按文件名，不比较文件内容） ----------
+              if [ -f "$TARGET_PATH" ]; then
+                echo "本地已是最新版本，跳过下载"
+                continue
+              fi
+
+              # ---------- 下载新版本（重试3次） ----------
+              DL_URL="$PKG_BASE_URL/$SUB_DIR/$REMOTE_NAME"
+              echo "下载: $DL_URL"
+              DL_OK=0
+              for RETRY in 1 2 3; do
+                if wget -q --show-progress -O "$TARGET_PATH" "$DL_URL" && [ -s "$TARGET_PATH" ]; then
+                  DL_OK=1
+                  break
+                fi
+                echo "  第${RETRY}次下载失败，重试..."
+                sleep 2
+                rm -f "$TARGET_PATH"
+              done
+
+              if [ $DL_OK -eq 1 ]; then
+                FILE_SIZE=$(du -h "$TARGET_PATH" | cut -f1)
+                echo "下载成功 ($FILE_SIZE)"
+                echo "$REMOTE_NAME" >> "$UPDATED_PKGS_FILE"
+                # 避免重复记录架构
+                if ! grep -qxF "$SRC_ARCH" "$UPDATED_ARCHS_FILE" 2>/dev/null; then
+                  echo "$SRC_ARCH" >> "$UPDATED_ARCHS_FILE"
+                fi
+                CHANGED=1
+              else
+                echo "::error::下载失败: $REMOTE_NAME"
+                rm -f "$TARGET_PATH"
+              fi
+            done
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "同步结果汇总"
+          echo "=========================================="
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          if [ -s "$UPDATED_PKGS_FILE" ]; then
+            {
+              echo "updated_pkgs<<PKGS_EOF"
+              cat "$UPDATED_PKGS_FILE"
+              echo "PKGS_EOF"
+            } >> "$GITHUB_OUTPUT"
+            sort -u "$UPDATED_ARCHS_FILE" | paste -sd ',' - > /tmp/archs_uniq.txt
+            echo "updated_archs=$(cat /tmp/archs_uniq.txt)" >> "$GITHUB_OUTPUT"
+            echo "本次更新包列表："
+            sed 's/^/  - /' "$UPDATED_PKGS_FILE"
+          else
+            echo "updated_pkgs=" >> "$GITHUB_OUTPUT"
+            echo "updated_archs=" >> "$GITHUB_OUTPUT"
+            echo "所有包均为最新版本。"
+          fi
+
+      # --------------------------------------------------------
+      # 第4步：提交并推送到仓库
+      # --------------------------------------------------------
+      - name: 提交并推送更新
+        if: steps.download.outputs.changed == '1'
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 提取版本号：优先从 dufs 主包提取
+          VERSION_INFO="unknown"
+          while IFS= read -r PKG; do
+            [ -z "$PKG" ] && continue
+            case "$PKG" in
+              dufs_*)
+                VERSION_INFO=$(echo "$PKG" | sed -E 's/dufs_([^_]+)_.*/\1/')
+                break
+                ;;
+            esac
+          done < /tmp/updated_pkgs.txt
+
+          if [ "$VERSION_INFO" = "unknown" ]; then
+            while IFS= read -r PKG; do
+              [ -z "$PKG" ] && continue
+              case "$PKG" in
+                luci-app-dufs_*)
+                  VERSION_INFO=$(echo "$PKG" | sed -E 's/luci-app-dufs_([^_]+)_.*/\1/')
+                  break
+                  ;;
+              esac
+            done < /tmp/updated_pkgs.txt
+          fi
+
+          BEIJING_NOW=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+          ARCHS=$(cat /tmp/archs_uniq.txt 2>/dev/null || echo "")
+
+          # 构造提交信息文件
+          COMMIT_MSG_FILE="/tmp/commit_msg.txt"
+          {
+            echo "🔄自动更新 dufs v${VERSION_INFO} | ${BEIJING_NOW} (北京时间)"
+            echo ""
+            echo "更新时间: ${BEIJING_NOW} (北京时间)"
+            echo "涉及架构: ${ARCHS}"
+            echo "更新的包:"
+            sed 's/^/  - /' /tmp/updated_pkgs.txt
+          } > "$COMMIT_MSG_FILE"
+
+          echo "===== 提交信息 ====="
+          cat "$COMMIT_MSG_FILE"
+          echo "===================="
+
+          git add run/
+          # 检查是否有实际变更需要提交
+          if git diff --cached --quiet; then
+            echo "没有实质变更需要提交（可能仅清理了旧文件但未新增）。"
+          else
+            git commit -F "$COMMIT_MSG_FILE"
+            git push
+            echo "变更已推送至仓库"
+          fi
+
+      # --------------------------------------------------------
+      # 第5步：无更新时提示
+      # --------------------------------------------------------
+      - name: 无需更新提示
+        if: steps.download.outputs.changed != '1'
+        run: |
+          echo "所有 dufs 软件包均为最新版本，无需提交。"
+
+      # --------------------------------------------------------
+      # 第6步：清理运行缓存
+      # --------------------------------------------------------
+      - name: 清理运行缓存
+        if: always()
+        run: |
+          echo "开始清理工作流运行缓存..."
+
+          rm -f /tmp/updated_pkgs.txt /tmp/updated_archs.txt /tmp/archs_uniq.txt /tmp/commit_msg.txt 2>/dev/null || true
+          find /tmp -maxdepth 1 \( -name "tmp.*" -o -name "*.ipk.tmp" -o -name "wget-log*" \) -type f -delete 2>/dev/null || true
+
+          find "$WORKDIR" -maxdepth 4 \( -name "*.tmp" -o -name "*.wget-tmp" -o -name "wget-log*" \) -type f -delete 2>/dev/null || true
+
+          sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+
+          echo "运行缓存清理完成"

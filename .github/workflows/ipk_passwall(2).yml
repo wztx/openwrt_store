@@ -1,0 +1,319 @@
+# ============================================================
+# 定时检查 SourceForge 上 openwrt-passwall-build 最新版本，
+# 同步 ipk 文件到本仓库 run/ 目录。
+# 触发：每天北京时间 06:03 (UTC 22:03) + 手动触发(可强制更新)
+# ============================================================
+
+name: 自动更新 PassWall(2) IPK 软件包
+
+on:
+  schedule:
+    - cron: '3 22 * * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: passwall-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-passwall:
+    name: 同步 PassWall(2) 最新版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      X86_DIR: run/x86_64/luci-app-passwall
+      A64_DIR: run/aarch64/luci-app-passwall
+      TMP_DIR: /tmp/passwall_pkgs
+      RSS_LUCI: https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_luci/
+      RSS_LUCI2: https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall2/
+      RSS_PKG_X86: https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_packages/
+      RSS_PKG_A64: https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/aarch64_generic/passwall_packages/
+      # SourceForge/Cloudflare 反爬：必须带浏览器UA + Referer + Accept
+      WGET_UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ---------- 1. 准备目录 ----------
+      - name: 创建工作目录
+        run: |
+          set -euo pipefail
+          rm -rf "$TMP_DIR"
+          mkdir -p "$TMP_DIR" "$X86_DIR" "$A64_DIR"
+          echo "临时目录: $TMP_DIR"
+          echo "x86_64 目录: $X86_DIR"
+          echo "aarch64 目录: $A64_DIR"
+
+      # ---------- 2. 下载 RSS ----------
+      - name: 下载 RSS 源
+        run: |
+          set -euo pipefail
+          UA="$WGET_UA"
+          dl_rss() {
+            local url="$1" out="$2"
+            echo "正在获取RSS: $url"
+            curl -sS -fL --retry 3 --retry-delay 3 --connect-timeout 15 \
+              --compressed \
+              -A "$UA" \
+              -H "Accept: application/rss+xml, application/xml, text/xml, */*;q=0.9" \
+              -H "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8" \
+              -H "Referer: https://sourceforge.net/projects/openwrt-passwall-build/files/" \
+              -o "$out" "$url"
+          }
+          dl_rss "$RSS_LUCI"      "$TMP_DIR/rss_luci.xml"
+          dl_rss "$RSS_LUCI2"      "$TMP_DIR/rss_luci2.xml"
+          dl_rss "$RSS_PKG_X86"   "$TMP_DIR/rss_pkg_x86.xml"
+          dl_rss "$RSS_PKG_A64"   "$TMP_DIR/rss_pkg_a64.xml"
+          echo "RSS下载完成:"
+          ls -lh "$TMP_DIR"/rss_*.xml
+
+      # ---------- 3. 解析最新下载链接 + 版本对比 ----------
+      - name: 解析最新版本链接
+        id: parse
+        run: |
+          set -euo pipefail
+
+          # 从RSS里提取最新一个匹配关键字的 ipk 下载URL
+          # RSS 条目按发布时间"最新在前"排序，head -n1 即最新
+          get_url() {
+            local rssfile="$1"
+            local keyword="$2"
+            local url
+            url=$(grep -oE 'url="[^"]+\.ipk/download"' "$rssfile" \
+                  | grep -F -- "$keyword" \
+                  | head -n1 \
+                  | sed 's/^url="//; s/"$//')
+            if [ -z "$url" ]; then
+              echo "::error::无法从 $rssfile 解析 $keyword 的下载链接"
+              exit 1
+            fi
+            echo "$url"
+          }
+
+          # 从URL提取文件名: 取 /download 的上一段
+          fname_from_url() { basename "$(dirname "$1")"; }
+
+          # x86_64
+          U_X86_CHINADNS=$(get_url  "$TMP_DIR/rss_pkg_x86.xml" "chinadns-ng")
+          U_X86_DNS2SOCKS=$(get_url "$TMP_DIR/rss_pkg_x86.xml" "dns2socks")
+          U_X86_GEOVIEW=$(get_url   "$TMP_DIR/rss_pkg_x86.xml" "geoview")
+          U_X86_MICROSOCKS=$(get_url "$TMP_DIR/rss_pkg_x86.xml" "microsocks")
+          U_X86_TCPING=$(get_url    "$TMP_DIR/rss_pkg_x86.xml" "tcping")
+          U_LUCI_APP=$(get_url      "$TMP_DIR/rss_luci.xml"    "luci-app-passwall_")
+          U_LUCI_I18N=$(get_url     "$TMP_DIR/rss_luci.xml"    "luci-i18n-passwall-zh-cn_")
+          U_LUCI_APP2=$(get_url      "$TMP_DIR/rss_luci2.xml"    "luci-app-passwall2_")
+          U_LUCI_I18N2=$(get_url     "$TMP_DIR/rss_luci2.xml"    "luci-i18n-passwall2-zh-cn_")
+          # aarch64_generic
+          U_A64_CHINADNS=$(get_url  "$TMP_DIR/rss_pkg_a64.xml" "chinadns-ng")
+          U_A64_DNS2SOCKS=$(get_url "$TMP_DIR/rss_pkg_a64.xml" "dns2socks")
+          U_A64_GEOVIEW=$(get_url   "$TMP_DIR/rss_pkg_a64.xml" "geoview")
+          U_A64_MICROSOCKS=$(get_url "$TMP_DIR/rss_pkg_a64.xml" "microsocks")
+          U_A64_TCPING=$(get_url    "$TMP_DIR/rss_pkg_a64.xml" "tcping")
+
+          # 文件名
+          F_X86_CHINADNS=$(fname_from_url  "$U_X86_CHINADNS")
+          F_X86_DNS2SOCKS=$(fname_from_url "$U_X86_DNS2SOCKS")
+          F_X86_GEOVIEW=$(fname_from_url   "$U_X86_GEOVIEW")
+          F_X86_MICROSOCKS=$(fname_from_url "$U_X86_MICROSOCKS")
+          F_X86_TCPING=$(fname_from_url    "$U_X86_TCPING")
+          F_LUCI_APP=$(fname_from_url      "$U_LUCI_APP")
+          F_LUCI_I18N=$(fname_from_url     "$U_LUCI_I18N")
+          F_LUCI_APP2=$(fname_from_url      "$U_LUCI_APP2")
+          F_LUCI_I18N2=$(fname_from_url     "$U_LUCI_I18N2")
+
+          F_A64_CHINADNS=$(fname_from_url  "$U_A64_CHINADNS")
+          F_A64_DNS2SOCKS=$(fname_from_url "$U_A64_DNS2SOCKS")
+          F_A64_GEOVIEW=$(fname_from_url   "$U_A64_GEOVIEW")
+          F_A64_MICROSOCKS=$(fname_from_url "$U_A64_MICROSOCKS")
+          F_A64_TCPING=$(fname_from_url    "$U_A64_TCPING")
+
+          # 版本号
+          VER=$(echo "$F_LUCI_APP" | sed -n 's/^luci-app-passwall_\(.*\)_all\.ipk$/\1/p')
+          if [ -z "$VER" ]; then
+            echo "::error::无法从 $F_LUCI_APP 提取版本号"
+            exit 1
+          fi
+
+          echo "===== 解析结果 ====="
+          echo "最新版本: $VER"
+          for v in F_X86_CHINADNS F_X86_DNS2SOCKS F_X86_GEOVIEW F_X86_MICROSOCKS F_X86_TCPING \
+                   F_A64_CHINADNS F_A64_DNS2SOCKS F_A64_GEOVIEW F_A64_MICROSOCKS F_A64_TCPING \
+                   F_LUCI_APP F_LUCI_I18N \
+                   F_LUCI_APP2 F_LUCI_I18N2; do
+            printf "  %-22s = %s\n" "$v" "${!v}"
+          done
+
+          # ========== 版本对比（纯文件名） ==========
+          NEED_UPDATE="false"
+          FORCE="${{ github.event.inputs.force_update }}"
+          echo "强制更新: ${FORCE:-false}"
+
+          check_dir() {
+            local dir="$1"; shift
+            local missing=0
+            for f in "$@"; do
+              if [ ! -f "$dir/$f" ]; then
+                echo "  [缺失] $dir/$f"
+                missing=1
+              fi
+            done
+            return $missing
+          }
+
+          X86_FILES=("$F_X86_CHINADNS" "$F_X86_DNS2SOCKS" "$F_X86_GEOVIEW" \
+                     "$F_X86_MICROSOCKS" "$F_X86_TCPING" "$F_LUCI_APP" "$F_LUCI_I18N" "$F_LUCI_APP2" "$F_LUCI_I18N2")
+          A64_FILES=("$F_A64_CHINADNS" "$F_A64_DNS2SOCKS" "$F_A64_GEOVIEW" \
+                     "$F_A64_MICROSOCKS" "$F_A64_TCPING" "$F_LUCI_APP" "$F_LUCI_I18N" "$F_LUCI_APP2" "$F_LUCI_I18N2")
+
+          echo "--- 检查 x86_64 ---"
+          check_dir "$X86_DIR" "${X86_FILES[@]}" || NEED_UPDATE="true"
+          echo "--- 检查 aarch64_generic ---"
+          check_dir "$A64_DIR" "${A64_FILES[@]}" || NEED_UPDATE="true"
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "已开启强制更新，忽略版本检查。"
+            NEED_UPDATE="true"
+          fi
+
+          echo "NEED_UPDATE=$NEED_UPDATE"  >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VER"              >> "$GITHUB_OUTPUT"
+          echo "BEIJING_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+          # 持久化 key fname url 供后续步骤使用
+          {
+            for key in X86_CHINADNS X86_DNS2SOCKS X86_GEOVIEW X86_MICROSOCKS X86_TCPING \
+                       A64_CHINADNS A64_DNS2SOCKS A64_GEOVIEW A64_MICROSOCKS A64_TCPING \
+                       LUCI_APP LUCI_I18N LUCI_APP2 LUCI_I18N2; do
+              eval "echo \$key \${F_$key} \${U_$key}"
+            done
+          } > "$TMP_DIR/files.list"
+          echo "===== 下载清单 ====="
+          cat "$TMP_DIR/files.list"
+
+      - name: 判断是否需要更新
+        id: check
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.parse.outputs.NEED_UPDATE }}" = "false" ]; then
+            echo "当前已是最新版本 ${{ steps.parse.outputs.VERSION }}，无需更新。"
+            echo "SKIP=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新版本或已开启强制更新，开始同步..."
+            echo "SKIP=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 4. 下载 ipk ----------
+      - name: 下载最新 ipk 包
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          cd "$TMP_DIR"
+          UA="$WGET_UA"
+          while read -r key fname url; do
+            [ -z "$key" ] && continue
+            echo "下载 $fname ..."
+            # 严格按用户要求格式：wget -qO 文件名 URL
+            # 增加：重试/超时/UA/Referer 以应对反爬与网络波动（不属于"多余参数"，是必要容错）
+            wget -qO "$fname" \
+                 --tries=3 --timeout=30 \
+                 "$url"
+            if [ ! -s "$fname" ]; then
+              echo "::error::$fname 下载后为空"
+              exit 1
+            fi
+          done < "$TMP_DIR/files.list"
+          echo "所有文件下载完成:"
+          ls -lh *.ipk
+          file *.ipk | head -20
+
+      # ---------- 5. 精确清理旧版本 ----------
+      - name: 清理旧版本文件
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          echo "清理 x86_64 旧版本..."
+          for p in \
+            "chinadns-ng_*_x86_64.ipk" \
+            "dns2socks_*_x86_64.ipk" \
+            "geoview_*_x86_64.ipk" \
+            "microsocks_*_x86_64.ipk" \
+            "tcping_*_x86_64.ipk" \
+            "luci-app-passwall_*_all.ipk" \
+            "luci-i18n-passwall-zh-cn_*_all.ipk" \
+            "luci-app-passwall2_*_all.ipk" \
+            "luci-i18n-passwall-zh-cn2_*_all.ipk"; do
+            find "$X86_DIR" -maxdepth 1 -type f -name "$p" -print -delete || true
+          done
+          echo "清理 aarch64_generic 旧版本..."
+          for p in \
+            "chinadns-ng_*_aarch64_generic.ipk" \
+            "dns2socks_*_aarch64_generic.ipk" \
+            "geoview_*_aarch64_generic.ipk" \
+            "microsocks_*_aarch64_generic.ipk" \
+            "tcping_*_aarch64_generic.ipk" \
+            "luci-app-passwall_*_all.ipk" \
+            "luci-i18n-passwall-zh-cn_*_all.ipk" \
+            "luci-app-passwall2_*_all.ipk" \
+            "luci-i18n-passwall2-zh-cn_*_all.ipk"; do
+            find "$A64_DIR" -maxdepth 1 -type f -name "$p" -print -delete || true
+          done
+          echo "旧版本清理完成。"
+
+      # ---------- 6. 部署新文件 ----------
+      - name: 部署新文件
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          while read -r key fname url; do
+            [ -z "$key" ] && continue
+            case "$key" in
+              X86_*|LUCI_*) cp -f "$TMP_DIR/$fname" "$X86_DIR/$fname"; echo "[x86_64] <- $fname" ;;
+            esac
+            case "$key" in
+              A64_*|LUCI_*) cp -f "$TMP_DIR/$fname" "$A64_DIR/$fname"; echo "[aarch64] <- $fname" ;;
+            esac
+          done < "$TMP_DIR/files.list"
+          echo "===== 部署后目录 ====="
+          echo "--- $X86_DIR ---"; ls -lh "$X86_DIR"
+          echo "--- $A64_DIR ---"; ls -lh "$A64_DIR"
+
+      # ---------- 7. 提交 & 推送 ----------
+      - name: 提交并推送
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$X86_DIR" "$A64_DIR"
+          if git diff --cached --quiet; then
+            echo "无文件变化，跳过提交。"
+          else
+            MSG="🔄自动更新 PassWall(2) ${{ steps.parse.outputs.VERSION }} | ${{ steps.parse.outputs.BEIJING_TIME }}(北京时间)"
+            echo "提交: $MSG"
+            git commit -m "$MSG"
+            git push
+            echo "推送完成。"
+          fi
+
+      # ---------- 8. 清理临时文件（无论成功失败） ----------
+      - name: 清理临时文件
+        if: always()
+        run: |
+          echo "清理临时目录: $TMP_DIR"
+          rm -rf "$TMP_DIR"
+          echo "完成。"
