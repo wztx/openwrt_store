@@ -10,14 +10,14 @@
 | luci-app-advancedplus | 高级设置 | [luci-app-advancedplus](https://github.com/sirpdboy/luci-app-advancedplus) |
 | luci-app-uninstall | 高级卸载 | [用于彻底卸载插件](https://xz.vumstar.com) |
 | luci-app-netwizard | 网络配置向导插件 | [luci-app-netwizard](https://github.com/sirpdboy/luci-app-netwizard) |
+| luci-app-taskplan | 任务计划 | [luci-app-taskplan](https://github.com/sirpdboy/luci-app-taskplan) |
 | luci-app-partexp | 分区扩容插件 | [luci-app-partexp](https://github.com/sirpdboy/luci-app-partexp) |
 | luci-app-quickstart | iStore首页和网络向导 | [luci-app-quickstart](https://github.com/kiddin9/op-packages/tree/main/luci-app-quickstart) |
 | luci-app-turboacc | TurboACC 网络加速器(集成BBR、shortcut)| [turboacc](https://github.com/wukongdaily/store/tree/master/run/x86/luci-app-turboacc) |
 | luci-app-unishare | 统一文件共享 | [源码编译1](https://github.com/linkease/nas-packages-luci/tree/main/luci/luci-app-unishare) [源码编译2](https://github.com/N-wrt/openwrt-ext/blob/master/linkease/luci/luci-app-unishare/)|
-| luci-theme-kucat | 酷猫主题 | [sirpdboy/luci-theme-kucat](https://github.com/sirpdboy/luci-theme-kucat) |
+| luci-theme-kucat | 酷猫主题 | [luci-theme-kucat](https://github.com/sirpdboy/luci-theme-kucat) |
 | luci-theme-aurorz | 极光主题 | [luci-theme-aurora](https://github.com/eamonxg/luci-theme-aurora) |
 | luci-theme-argon | Argon主题| [luci-theme-argon](https://github.com/jerrykuku/luci-theme-argon) |
-| luci-app-taskplan | 任务计划 | [luci-app-taskplan](https://github.com/sirpdboy/luci-app-taskplan) |
 | luci-app-adguardhome  | 本地DNS去广告 | [AdGuardHome](https://github.com/AdguardTeam/AdGuardHome) |
 | luci-app-mosdns | 高性能DNS分流器，支持DoH/DoQ等 | [luci-app-mosdns](https://github.com/sbwml/luci-app-mosdns) |
 | luci-app-smartdns | 高性能DNS服务器 | [luci-app-smartdns](https://github.com/pymumu/luci-app-smartdns) |
@@ -25,6 +25,9 @@
 | luci-app-passwall2 | 代理工具 | [openwrt-passwall2](https://github.com/Openwrt-Passwall/openwrt-passwall2) [package](https://sourceforge.net/projects/openwrt-passwall-build/files/releases/) |
 | luci-app-nikki | 代理工具 | [nikki](https://github.com/nikkinikki-org/OpenWrt-nikki) |
 | luci-app-ssr-plus | 代理工具 | [luci-app-ssr-plus](https://github.com/fw876/helloworld) |
+| Xray-core | 代理工具 | [Xray-core](https://github.com/XTLS/Xray-core/) |
+| Hysteria-core | 代理工具 | [Hysteria](https://github.com/HyNetworks/hysteria) |
+| V2ray-rules-dat | 路由规则文件 | [V2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat/) |
 | tailscale | ZeroTier 类似的 VPN 工具，基于 WireGuard | [tailscale](https://github.com/tailscale/tailscale) |
 | luci-app-lucky | Lucky大吉,软硬路由公网神器,ipv6/ipv4 端口转发,反向代理 | [luci-app-lucky](https://github.com/sirpdboy/luci-app-lucky) |
 | luci-app-easytier | 组网 | [luci-app-easytier](https://github.com/EasyTier/luci-app-easytier) |
