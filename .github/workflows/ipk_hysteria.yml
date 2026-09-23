@@ -8,10 +8,6 @@
 name: 自动构建 Hysteria IPK 安装包
 
 on:
-  push:
-    paths-ignore:
-      - '**.md'
-      - '**.txt'
   schedule:
     - cron: '32 22 * * *'		# 每天 UTC 时间 22:32（北京时间 06:32）定时触发
 
