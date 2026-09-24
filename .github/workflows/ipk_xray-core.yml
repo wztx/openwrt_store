@@ -1,7 +1,7 @@
 # ============================================================
 # Xray-core 自动同步打包工作流 (OpenWrt 24.10 ipk)
 # ============================================================
-name: Xray-core 自动同步打包
+name: 自动构建 Xray-core IPK 安装包
 
 # --------------------------------------------------------
 # 触发方式
@@ -89,8 +89,8 @@ jobs:
           ver="${{ steps.get_version.outputs.latest_version }}"
           force="${{ steps.params.outputs.force_update }}"
 
-          x86_file="run/x86_64/xray-core/xray-core_${ver}_x86_64.ipk"
-          arm_file="run/aarch64/xray-core/xray-core_${ver}_aarch64.ipk"
+          x86_file="run/x86_64/xray-core/xray-core_${ver}-1_x86_64.ipk"
+          arm_file="run/aarch64/xray-core/xray-core_${ver}-1_aarch64.ipk"
 
           echo "期望文件："
           echo "  - ${x86_file}"
@@ -171,7 +171,7 @@ jobs:
 
             printf '%s\n' \
               "Package: xray-core" \
-              "Version: ${ver}" \
+              "Version: ${ver}-1" \
               "Depends: libc" \
               "Source: XTLS/Xray-core" \
               "License: MPL-2.0" \
@@ -207,7 +207,7 @@ jobs:
             #     ★ 关键修复：最外层必须是 tar.gz（OpenWrt ipk 规范），不是 Debian 的 ar 格式！
             #     顺序必须为：debian-binary → control.tar.gz → data.tar.gz（带 ./ 前缀）
             mkdir -p "$out_dir"
-            ipk_path="${out_dir}/xray-core_${ver}_${ipk_arch}.ipk"
+            ipk_path="${out_dir}/xray-core_${ver}-1_${ipk_arch}.ipk"
 
             echo "最终打包 ${ipk_path} ..."
             ( cd "$pkg_build" && tar -czf "${WORK_DIR}/${ipk_path}" \
@@ -238,7 +238,7 @@ jobs:
               for f in xray-core_*.ipk; do
                 [ -e "$f" ] || continue
                 case "$f" in
-                  *"_${ver}_"*)
+                  *"_${ver}-1_"*)
                   echo "  保留：$f"
                     ;;
                   *)
@@ -268,9 +268,9 @@ jobs:
           for ipk_arch in x86_64 aarch64; do
             ipk_path=""
             if [ "$ipk_arch" = "x86_64" ]; then
-              ipk_path="run/x86_64/xray-core/xray-core_${ver}_x86_64.ipk"
+              ipk_path="run/x86_64/xray-core/xray-core_${ver}-1_x86_64.ipk"
             else
-              ipk_path="run/aarch64/xray-core/xray-core_${ver}_aarch64.ipk"
+              ipk_path="run/aarch64/xray-core/xray-core_${ver}-1_aarch64.ipk"
             fi
 
             echo "--------------------------------------------"
