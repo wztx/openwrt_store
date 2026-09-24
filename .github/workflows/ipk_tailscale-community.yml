@@ -55,7 +55,7 @@ jobs:
       # 步骤 1：检出仓库代码
       # --------------------------------------------------
       - name: 📥 检出当前仓库代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}		# 使用持久化令牌推送

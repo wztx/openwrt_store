@@ -36,7 +36,7 @@ jobs:
       # 第1步：检出仓库（固定工作目录，防止目录漂移）
       # --------------------------------------------------------
       - name: 检出仓库代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
