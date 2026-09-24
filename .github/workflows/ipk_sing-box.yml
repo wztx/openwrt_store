@@ -73,8 +73,8 @@ jobs:
             exit 1
           fi
 
-          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box-[^"]+-linux-amd64\.tar\.gz' "$RESP_FILE")"
-          AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_linux_aarch64\.pkg\.tar\.zst' "$RESP_FILE")"
+          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box-[^"]+-openwrt_x86_64\.ipk' "$RESP_FILE")"
+          AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_openwrt_aarch64_generic\.ipk' "$RESP_FILE")"
 
           if [ -z "$AMD64_URL" ]; then
             echo "::error::未找到 amd64 二进制包下载链接"
@@ -140,8 +140,8 @@ jobs:
           }
           trap cleanup EXIT INT TERM
 
-          AMD64_FILE="${TMPDIR}/sing-box_1.14.2_openwrt_x86_64.ipk"
-          AARCH64_FILE="${TMPDIR}/sing-box_1.14.2_openwrt_aarch64_generic.ipk"
+          AMD64_FILE="${TMPDIR}/sing-box-x86_64.ipk"
+          AARCH64_FILE="${TMPDIR}/sing-box-generic.ipk"
           WORK_AMD64="${TMPDIR}/build-amd64"
           WORK_AARCH64="${TMPDIR}/build-aarch64"
           mkdir -p "$WORK_AMD64" "$WORK_AARCH64"
