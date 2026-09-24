@@ -1,320 +1,397 @@
-# ============================================================
-# 工作流名称：自动构建 v2ray-rules-dat IPK 安装包并同步至本仓库
-# 适用环境：OpenWrt 24.10
-# 支持架构：x86_64、aarch64_generic
-# 下载源  ：https://api.github.com/repos/HyNetworks/hysteria/releases
-# 触发方式：每日定时检查 + 手动触发（支持强制更新）
-# 并发控制：同一分支同一工作流同一时间仅允许一个实例运行（排队等待，不取消进行中任务）
-# ============================================================
+# =============================================================================
+# 工作流名称：v2ray-rules-dat 数据包自动同步与 IPK 安装包生成
+#
+# 功能说明：
+#   1. 每天定时检查上游 Loyalsoldier/v2ray-rules-dat 的最新发布版本
+#   2. 支持手动触发，勾选「强制更新」后可忽略版本对比结果重新打包
+#   3. 下载 geoip.dat 与 geosite.dat，并用上游 sha256sum 做完整性校验
+#   4. 按 OpenWrt 24.10 SDK 中 scripts/ipkg-build 的规范分别打包两个 ipk 安装包
+#   5. 校验 ipk 完整性后推送到本仓库对应架构目录，并精确清理旧版本安装包
+#
+# 使用环境：OpenWrt 24.10
+# 下载来源：https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases
+# =============================================================================
 
 name: 自动构建 v2ray-rules-dat IPK 安装包
 
+# 触发方式：每天定时检查 + 手动触发（支持强制更新）
 on:
+  # 每天 33:34 UTC 触发，即北京时间次日 06:34
   schedule:
-    - cron: '34 22 * * *'			# 每天定时自动运行（北京时间 06:34 对应 UTC 22:34）
-
+    - cron: '34 22 * * *'
+  # 手动触发，勾选强制更新后忽略版本对比结果
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        description: '强制更新：勾选后忽略版本对比结果，重新下载并打包'
         required: false
-        type: boolean
         default: false
+        type: boolean
 
+# 工作权限：推送提交（写入仓库）与清理仓库内旧版本安装包
+permissions:
+  contents: write
+
+# 并发限制：同一分组同一时间只允许一个实例运行，不取消正在运行的实例
 concurrency:
   group: v2ray-rules-dat-ipk-sync
-  cancel-in-progress: false			# 并发限制：同一工作流同一分支只允许一个运行，新的会等待旧的结束
+  cancel-in-progress: false
 
-permissions:
-  contents: write					# 所需权限：需要向仓库推送内容、删除旧文件
+env:
+  # 上游仓库与接口地址
+  UPSTREAM_REPO: 'Loyalsoldier/v2ray-rules-dat'
+  UPSTREAM_API: 'https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest'
+  UPSTREAM_DOWNLOAD_BASE: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download'
+  # 请求头 UA，避免 GitHub 接口因缺少 UA 而拒绝请求
+  HTTP_USER_AGENT: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+  # 临时工作目录，收尾步骤无论成功失败都会清理
+  BUILD_ROOT: '/tmp/v2ray-rules-dat-build'
+  # ipk 内数据文件的安装位置
+  INSTALL_DIR: 'usr/share/v2ray'
+  # 发布号，control 中的 Version 使用「版本号-发布号」格式
+  RELEASE: '1'
+  # 两个架构对应的仓库目录
+  ARCH_DIR_X86_64: 'run/x86_64/v2ray-rules-dat'
+  ARCH_DIR_AARCH64: 'run/aarch64/v2ray-rules-dat'
+  # 安装包维护者信息
+  PKG_MAINTAINER: 'v2ray-rules-dat sync bot'
 
 jobs:
-  build-and-sync:
-    name: 检查更新并打包IPK
+  # 任务：检查上游版本并生成 ipk 安装包
+  sync-and-build:
+    name: 检查上游版本并生成 IPK 安装包
     runs-on: ubuntu-latest
-
-    env:
-      TMP_WORK_DIR: "/tmp/v2ray-rules-dat-build"
-      UPSTREAM_API: "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest"
-      UA_HEADER: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
+    timeout-minutes: 30
     steps:
-      - name: 检出仓库代码
+      - name: 检出本仓库代码
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 固定检出默认分支，保证定时触发时推送目标明确
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: 创建临时工作目录
+      - name: 获取上游最新版本号
+        id: version
         run: |
-          rm -rf "$TMP_WORK_DIR"
-          mkdir -p "$TMP_WORK_DIR"
-          echo "临时工作目录: $TMP_WORK_DIR"
-
-      - name: 获取上游最新版本信息
-        id: get_version
-        run: |
-          echo "正在查询上游最新版本..."
-          RELEASE_JSON=$(curl -fsSL -H "User-Agent: $UA_HEADER" "$UPSTREAM_API")
-          if [ -z "$RELEASE_JSON" ]; then
-            echo "::error::无法获取上游版本信息"
+          set -euo pipefail
+          mkdir -p "$BUILD_ROOT"
+          response_file="$BUILD_ROOT/release.json"
+          echo "请求上游最新发布信息: ${UPSTREAM_API}"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -H "User-Agent: ${HTTP_USER_AGENT}" \
+            -H "Accept: application/vnd.github+json" \
+            -o "$response_file" \
+            "$UPSTREAM_API"
+          upstream_version="$(jq -r '.tag_name // empty' "$response_file")"
+          # 版本号必须为纯数字，避免非法标签污染文件名
+          if [[ ! "$upstream_version" =~ ^[0-9]{6,}$ ]]; then
+            echo "上游返回的版本号不合法: ${upstream_version}" >&2
             exit 1
           fi
-          LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-          echo "最新版本号: $LATEST_TAG"
-          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          GEOIP_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="geoip.dat") | .browser_download_url')
-          GEOSITE_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="geosite.dat") | .browser_download_url')
-          GEOIP_SHA_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="geoip.dat.sha256sum") | .browser_download_url')
-          GEOSITE_SHA_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="geosite.dat.sha256sum") | .browser_download_url')
-          echo "geoip_url=$GEOIP_URL" >> "$GITHUB_OUTPUT"
-          echo "geosite_url=$GEOSITE_URL" >> "$GITHUB_OUTPUT"
-          echo "geoip_sha_url=$GEOIP_SHA_URL" >> "$GITHUB_OUTPUT"
-          echo "geosite_sha_url=$GEOSITE_SHA_URL" >> "$GITHUB_OUTPUT"
-          echo "上游版本信息获取完成"
+          echo "上游最新版本号: ${upstream_version}"
+          echo "upstream_version=${upstream_version}" >> "$GITHUB_OUTPUT"
 
-      - name: 检查版本是否已存在
-        id: check_exist
+      - name: 版本对比（纯文件名对比）
+        id: check
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+          FORCE_UPDATE: ${{ inputs.force_update }}
         run: |
-          TAG="${{ steps.get_version.outputs.latest_tag }}"
-          FORCE="${{ github.event.inputs.force_update || 'false' }}"
-          GEOIP_PKG="v2ray-geoip_${TAG}_all.ipk"
-          GEOSITE_PKG="v2ray-geosite_${TAG}_all.ipk"
-
-          ARCH_DIRS=(
-            "run/x86_64/v2ray-rules-dat"
-            "run/aarch64/v2ray-rules-dat"
-          )
-
-          ALL_EXIST="true"
-          echo "检查各架构目录文件是否存在..."
-          for dir in "${ARCH_DIRS[@]}"; do
-            if [ ! -f "$dir/$GEOIP_PKG" ]; then
-              echo "  [缺失] $dir/$GEOIP_PKG"
-              ALL_EXIST="false"
-            else
-              echo "  [存在] $dir/$GEOIP_PKG"
-            fi
-            if [ ! -f "$dir/$GEOSITE_PKG" ]; then
-              echo "  [缺失] $dir/$GEOSITE_PKG"
-              ALL_EXIST="false"
-            else
-              echo "  [存在] $dir/$GEOSITE_PKG"
-            fi
+          set -euo pipefail
+          geoip_ipk="v2ray-geoip_${UPSTREAM_VERSION}_all.ipk"
+          geosite_ipk="v2ray-geosite_${UPSTREAM_VERSION}_all.ipk"
+          missing=0
+          # 纯文件名对比：两个架构目录下的两个安装包全部存在即视为已同步
+          for arch_dir in "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"; do
+            for ipk_name in "$geoip_ipk" "$geosite_ipk"; do
+              if [ -f "${arch_dir}/${ipk_name}" ]; then
+                echo "已存在: ${arch_dir}/${ipk_name}"
+              else
+                echo "缺失: ${arch_dir}/${ipk_name}"
+                missing=1
+              fi
+            done
           done
-
-          if [ "$ALL_EXIST" = "true" ] && [ "$FORCE" != "true" ]; then
-            echo "::notice::版本 $TAG 所有架构包均已存在，无需更新。"
-            echo "need_update=false" >> "$GITHUB_OUTPUT"
+          if [ "$missing" -eq 0 ] && [ "$FORCE_UPDATE" != 'true' ]; then
+            echo "版本 ${UPSTREAM_VERSION} 的安装包已全部存在，跳过本次打包"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            if [ "$FORCE" = "true" ]; then
-              echo "强制更新模式已开启，将重新打包。"
-            else
-              echo "存在缺失文件，需要更新。"
-            fi
-            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "需要执行下载与打包流程"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "geoip_pkg=$GEOIP_PKG" >> "$GITHUB_OUTPUT"
-          echo "geosite_pkg=$GEOSITE_PKG" >> "$GITHUB_OUTPUT"
 
-      - name: 下载校验数据文件
-        if: steps.check_exist.outputs.need_update == 'true'
+      - name: 下载上游数据文件并校验
+        if: steps.check.outputs.skip == 'false'
+        id: download
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
         run: |
-          set -e
-          cd "$TMP_WORK_DIR"
-          echo "开始下载 geoip.dat ..."
-          curl -fsSL -H "User-Agent: $UA_HEADER" -o geoip.dat "${{ steps.get_version.outputs.geoip_url }}"
-          curl -fsSL -H "User-Agent: $UA_HEADER" -o geoip.dat.sha256sum "${{ steps.get_version.outputs.geoip_sha_url }}"
-          echo "开始下载 geosite.dat ..."
-          curl -fsSL -H "User-Agent: $UA_HEADER" -o geosite.dat "${{ steps.get_version.outputs.geosite_url }}"
-          curl -fsSL -H "User-Agent: $UA_HEADER" -o geosite.dat.sha256sum "${{ steps.get_version.outputs.geosite_sha_url }}"
-
-          echo "校验文件完整性..."
-          sha256sum -c geoip.dat.sha256sum
-          sha256sum -c geosite.dat.sha256sum
-
-          GEOIP_SIZE=$(stat -c%s geoip.dat)
-          GEOSITE_SIZE=$(stat -c%s geosite.dat)
-          echo "geoip.dat 大小: $GEOIP_SIZE 字节"
-          echo "geosite.dat 大小: $GEOSITE_SIZE 字节"
-          echo "geoip_size_kb=$(( (GEOIP_SIZE + 1023) / 1024 ))" >> "$GITHUB_ENV"
-          echo "geosite_size_kb=$(( (GEOSITE_SIZE + 1023) / 1024 ))" >> "$GITHUB_ENV"
-          echo "文件下载并校验通过。"
-
-      - name: 构建 v2ray-geoip IPK 包
-        if: steps.check_exist.outputs.need_update == 'true'
-        run: |
-          set -e
-          cd "$TMP_WORK_DIR"
-          TAG="${{ steps.get_version.outputs.latest_tag }}"
-          BUILD_DIR="build-geoip"
-          rm -rf "$BUILD_DIR" control.tar.gz data.tar.gz debian-binary
-          mkdir -p "$BUILD_DIR/control"
-          mkdir -p "$BUILD_DIR/data/usr/share/v2ray"
-
-          cp geoip.dat "$BUILD_DIR/data/usr/share/v2ray/geoip.dat"
-
-          echo "2.0" > debian-binary
-
-          cat > "$BUILD_DIR/control/control" << EOF
-          Package: v2ray-geoip
-          Version: $TAG
-          Architecture: all
-          Maintainer: Loyalsoldier
-          Section: net
-          Priority: optional
-          Installed-Size: ${{ env.geoip_size_kb }}
-          Description: V2Ray GeoIP Data
-          Enhanced GeoIP data for V2Ray.
-          Source: https://github.com/Loyalsoldier/v2ray-rules-dat
-          EOF
-
-          cd "$BUILD_DIR/control"
-          tar czf "$TMP_WORK_DIR/control.tar.gz" .
-          cd "$TMP_WORK_DIR/$BUILD_DIR/data"
-          tar czf "$TMP_WORK_DIR/data.tar.gz" .
-          cd "$TMP_WORK_DIR"
-          tar czf "${{ steps.check_exist.outputs.geoip_pkg }}" ./debian-binary ./control.tar.gz ./data.tar.gz
-          rm -f control.tar.gz data.tar.gz debian-binary
-          echo "geoip ipk 打包完成: ${{ steps.check_exist.outputs.geoip_pkg }}"
-          ls -lh "${{ steps.check_exist.outputs.geoip_pkg }}"
-
-      - name: 构建 v2ray-geosite IPK 包
-        if: steps.check_exist.outputs.need_update == 'true'
-        run: |
-          set -e
-          cd "$TMP_WORK_DIR"
-          TAG="${{ steps.get_version.outputs.latest_tag }}"
-          BUILD_DIR="build-geosite"
-          rm -rf "$BUILD_DIR" control.tar.gz data.tar.gz debian-binary
-          mkdir -p "$BUILD_DIR/control"
-          mkdir -p "$BUILD_DIR/data/usr/share/v2ray"
-
-          cp geosite.dat "$BUILD_DIR/data/usr/share/v2ray/geosite.dat"
-
-          echo "2.0" > debian-binary
-
-          cat > "$BUILD_DIR/control/control" << EOF
-          Package: v2ray-geosite
-          Version: $TAG
-          Architecture: all
-          Maintainer: Loyalsoldier
-          Section: net
-          Priority: optional
-          Installed-Size: ${{ env.geosite_size_kb }}
-          Description: V2Ray GeoSite Data
-          Enhanced GeoSite data for V2Ray.
-          Source: https://github.com/Loyalsoldier/v2ray-rules-dat
-          EOF
-
-          cd "$BUILD_DIR/control"
-          tar czf "$TMP_WORK_DIR/control.tar.gz" .
-          cd "$TMP_WORK_DIR/$BUILD_DIR/data"
-          tar czf "$TMP_WORK_DIR/data.tar.gz" .
-          cd "$TMP_WORK_DIR"
-          tar czf "${{ steps.check_exist.outputs.geosite_pkg }}" ./debian-binary ./control.tar.gz ./data.tar.gz
-          rm -f control.tar.gz data.tar.gz debian-binary
-          echo "geosite ipk 打包完成: ${{ steps.check_exist.outputs.geosite_pkg }}"
-          ls -lh "${{ steps.check_exist.outputs.geosite_pkg }}"
-
-      - name: 校验IPK包完整性
-        if: steps.check_exist.outputs.need_update == 'true'
-        run: |
-          set -e
-          cd "$TMP_WORK_DIR"
-          VERIFY_DIR="ipk-verify"
-          rm -rf "$VERIFY_DIR"
-          mkdir -p "$VERIFY_DIR"
-
-          echo "校验 v2ray-geoip ipk 结构..."
-          tar tzf "${{ steps.check_exist.outputs.geoip_pkg }}" | sort > "$VERIFY_DIR/geoip-list.txt"
-          grep -qx './debian-binary' "$VERIFY_DIR/geoip-list.txt" || { echo "::error::geoip ipk 缺失 debian-binary"; exit 1; }
-          grep -qx './control.tar.gz' "$VERIFY_DIR/geoip-list.txt" || { echo "::error::geoip ipk 缺失 control.tar.gz"; exit 1; }
-          grep -qx './data.tar.gz' "$VERIFY_DIR/geoip-list.txt" || { echo "::error::geoip ipk 缺失 data.tar.gz"; exit 1; }
-          cd "$VERIFY_DIR"
-          tar xzf "../${{ steps.check_exist.outputs.geoip_pkg }}" ./data.tar.gz
-          tar tzf data.tar.gz | grep -q '^\./usr/share/v2ray/geoip\.dat$' || { echo "::error::geoip ipk 数据路径错误"; exit 1; }
-          tar xzf data.tar.gz
-          test -f "./usr/share/v2ray/geoip.dat" || { echo "::error::geoip.dat 未正确打包"; exit 1; }
-          test -s "./usr/share/v2ray/geoip.dat" || { echo "::error::geoip.dat 文件为空"; exit 1; }
-          cd "$TMP_WORK_DIR"
-          rm -rf "$VERIFY_DIR"
-          mkdir -p "$VERIFY_DIR"
-
-          echo "校验 v2ray-geosite ipk 结构..."
-          tar tzf "${{ steps.check_exist.outputs.geosite_pkg }}" | sort > "$VERIFY_DIR/geosite-list.txt"
-          grep -qx './debian-binary' "$VERIFY_DIR/geosite-list.txt" || { echo "::error::geosite ipk 缺失 debian-binary"; exit 1; }
-          grep -qx './control.tar.gz' "$VERIFY_DIR/geosite-list.txt" || { echo "::error::geosite ipk 缺失 control.tar.gz"; exit 1; }
-          grep -qx './data.tar.gz' "$VERIFY_DIR/geosite-list.txt" || { echo "::error::geosite ipk 缺失 data.tar.gz"; exit 1; }
-          cd "$VERIFY_DIR"
-          tar xzf "../${{ steps.check_exist.outputs.geosite_pkg }}" ./data.tar.gz
-          tar tzf data.tar.gz | grep -q '^\./usr/share/v2ray/geosite\.dat$' || { echo "::error::geosite ipk 数据路径错误"; exit 1; }
-          tar xzf data.tar.gz
-          test -f "./usr/share/v2ray/geosite.dat" || { echo "::error::geosite.dat 未正确打包"; exit 1; }
-          test -s "./usr/share/v2ray/geosite.dat" || { echo "::error::geosite.dat 文件为空"; exit 1; }
-          cd "$TMP_WORK_DIR"
-          rm -rf "$VERIFY_DIR"
-
-          echo "IPK 包结构和完整性校验通过。"
-
-      - name: 清理旧版本并部署新包
-        if: steps.check_exist.outputs.need_update == 'true'
-        run: |
-          set -e
-          ARCH_DIRS=(
-            "run/x86_64/v2ray-rules-dat"
-            "run/aarch64/v2ray-rules-dat"
-          )
-
-          TAG="${{ steps.get_version.outputs.latest_tag }}"
-          GEOIP_PKG="${{ steps.check_exist.outputs.geoip_pkg }}"
-          GEOSITE_PKG="${{ steps.check_exist.outputs.geosite_pkg }}"
-
-          for dir in "${ARCH_DIRS[@]}"; do
-            echo "处理目录: $dir"
-            mkdir -p "$dir"
-
-            echo "  清理旧版本 v2ray-geoip 包..."
-            find "$dir" -maxdepth 1 -type f -name 'v2ray-geoip_*_all.ipk' ! -name "$GEOIP_PKG" -print -delete || true
-
-            echo "  清理旧版本 v2ray-geosite 包..."
-            find "$dir" -maxdepth 1 -type f -name 'v2ray-geosite_*_all.ipk' ! -name "$GEOSITE_PKG" -print -delete || true
-
-            echo "  复制新版本包..."
-            cp "$TMP_WORK_DIR/$GEOIP_PKG" "$dir/"
-            cp "$TMP_WORK_DIR/$GEOSITE_PKG" "$dir/"
-
-            ls -lh "$dir"
+          set -euo pipefail
+          download_dir="$BUILD_ROOT/download"
+          rm -rf "$download_dir"
+          mkdir -p "$download_dir"
+          for data_file in geoip.dat geosite.dat; do
+            echo "下载数据文件: ${data_file}"
+            curl -fsSL --retry 3 --retry-delay 2 \
+              -H "User-Agent: ${HTTP_USER_AGENT}" \
+              -o "${download_dir}/${data_file}" \
+              "${UPSTREAM_DOWNLOAD_BASE}/${UPSTREAM_VERSION}/${data_file}"
+            echo "下载校验文件: ${data_file}.sha256sum"
+            curl -fsSL --retry 3 --retry-delay 2 \
+              -H "User-Agent: ${HTTP_USER_AGENT}" \
+              -o "${download_dir}/${data_file}.sha256sum" \
+              "${UPSTREAM_DOWNLOAD_BASE}/${UPSTREAM_VERSION}/${data_file}.sha256sum"
           done
-          echo "新版本包部署完成。"
+          # 逐文件比对 sha256，避免直接使用 sha256sum -c 时上游文件名不一致导致的误报
+          for data_file in geoip.dat geosite.dat; do
+            if [ ! -s "${download_dir}/${data_file}" ]; then
+              echo "数据文件为空: ${data_file}" >&2
+              exit 1
+            fi
+            expected_sum="$(awk 'NR == 1 { print $1 }' "${download_dir}/${data_file}.sha256sum")"
+            actual_sum="$(sha256sum "${download_dir}/${data_file}" | awk '{ print $1 }')"
+            if [ -z "$expected_sum" ] || [ "$expected_sum" != "$actual_sum" ]; then
+              echo "sha256 校验失败: ${data_file} 期望 ${expected_sum} 实际 ${actual_sum}" >&2
+              exit 1
+            fi
+            echo "sha256 校验通过: ${data_file} ${actual_sum}"
+          done
 
-      - name: 提交并推送变更
-        if: steps.check_exist.outputs.need_update == 'true'
+      - name: 构建 IPK 安装包
+        if: steps.check.outputs.skip == 'false'
+        id: build
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
         run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          download_dir="$BUILD_ROOT/download"
+          build_dir="$BUILD_ROOT/build"
+          rm -rf "$build_dir"
+          mkdir -p "$build_dir"
+          package_version="${UPSTREAM_VERSION}-${RELEASE}"
+          echo "安装包版本: ${package_version}"
 
-          BEIJING_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
-          TAG="${{ steps.get_version.outputs.latest_tag }}"
+          # 分别制作 geoip 与 geosite 两个安装包
+          for entry in "v2ray-geoip:geoip.dat" "v2ray-geosite:geosite.dat"; do
+            pkg_name="${entry%%:*}"
+            data_file="${entry##*:}"
+            pkg_root="${build_dir}/${pkg_name}"
+            ipk_stage="${build_dir}/${pkg_name}.stage"
 
-          git add -A run/x86_64/v2ray-rules-dat/ run/aarch64/v2ray-rules-dat/
+            rm -rf "$pkg_root" "$ipk_stage"
+            mkdir -p "${pkg_root}/CONTROL" "${pkg_root}/${INSTALL_DIR}" "$ipk_stage"
+
+            # 安装数据文件到 ipk 内的目标路径
+            install -m 0644 "${download_dir}/${data_file}" "${pkg_root}/${INSTALL_DIR}/${data_file}"
+
+            # 排除清单：CONTROL 目录不进入数据包，与官方 ipkg-build 的 -X 行为一致
+            printf 'CONTROL\n' > "${build_dir}/${pkg_name}.exclude"
+
+            # 生成 data.tar.gz：进入包根目录后以 . 归档，避免手工列文件列表造成路径遗漏或目录项丢失
+            (
+              cd "$pkg_root" && tar --format=gnu --numeric-owner --sort=name \
+                -X "${build_dir}/${pkg_name}.exclude" \
+                -czpf "${ipk_stage}/data.tar.gz" .
+            )
+
+            # Installed-Size 取 data.tar.gz 解压后的字节数，与官方 ipkg-build 一致
+            installed_size="$(zcat "${ipk_stage}/data.tar.gz" | wc -c)"
+
+            # 生成 control 文件；用 printf 逐行输出，避免 YAML 块标量与 heredoc 结束符的缩进耦合陷阱
+            printf 'Package: %s\nVersion: %s\nArchitecture: all\nSection: net\nPriority: optional\nMaintainer: %s\nInstalled-Size: %s\nDescription: v2ray rules data file %s\n' \
+              "$pkg_name" "$package_version" "$PKG_MAINTAINER" "$installed_size" "$data_file" \
+              > "${pkg_root}/CONTROL/control"
+
+            # 生成 control.tar.gz：同样以 . 归档，内部路径与官方规范一致
+            (
+              cd "${pkg_root}/CONTROL" && tar --format=gnu --numeric-owner --sort=name \
+                -czpf "${ipk_stage}/control.tar.gz" .
+            )
+
+            # debian-binary 必须带结尾换行符，符合文本文件规范
+            printf '2.0\n' > "${ipk_stage}/debian-binary"
+
+            # 组装外层 tar.gz 容器，成员顺序与官方 ipkg-build 完全一致
+            ipk_file="${build_dir}/${pkg_name}_${package_version}_all.ipk"
+            (
+              cd "$ipk_stage" && tar --format=gnu --numeric-owner --sort=name \
+                -czf "$ipk_file" \
+                ./debian-binary ./data.tar.gz ./control.tar.gz
+            )
+            echo "已生成安装包: ${ipk_file}"
+          done
+
+      - name: 校验 IPK 安装包完整性
+        if: steps.check.outputs.skip == 'false'
+        id: verify
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          build_dir="$BUILD_ROOT/build"
+          download_dir="$BUILD_ROOT/download"
+          verify_dir="$BUILD_ROOT/verify"
+          rm -rf "$verify_dir"
+          mkdir -p "$verify_dir"
+
+          for entry in "v2ray-geoip:geoip.dat" "v2ray-geosite:geosite.dat"; do
+            pkg_name="${entry%%:*}"
+            data_file="${entry##*:}"
+            ipk_file="${build_dir}/${pkg_name}_${UPSTREAM_VERSION}_all.ipk"
+
+            if [ ! -s "$ipk_file" ]; then
+              echo "安装包不存在或为空: ${ipk_file}" >&2
+              exit 1
+            fi
+
+            # 文件头校验：外层必须是 gzip 容器，用 od 读取魔数，兼容未安装 xxd 的运行环境
+            outer_magic="$(od -An -tx1 -N2 "$ipk_file" | tr -d ' \n')"
+            if [ "$outer_magic" != '1f8b' ]; then
+              echo "外层容器不是 gzip 格式: ${ipk_file} 魔数 ${outer_magic}" >&2
+              exit 1
+            fi
+            echo "文件头校验通过: ${pkg_name} 魔数 ${outer_magic}"
+
+            # 外层归档成员校验，成员名必须与官方规范完全一致
+            tar -tzf "$ipk_file" > "${verify_dir}/${pkg_name}.outer.list"
+            for member in './debian-binary' './data.tar.gz' './control.tar.gz'; do
+              if ! grep -qxF -- "$member" "${verify_dir}/${pkg_name}.outer.list"; then
+                echo "外层归档缺少成员: ${member}" >&2
+                exit 1
+              fi
+            done
+            echo "外层归档成员校验通过: ${pkg_name}"
+
+            # 解包到独立目录，避免污染构建目录
+            pkg_verify_dir="${verify_dir}/${pkg_name}"
+            mkdir -p "$pkg_verify_dir"
+            tar -xzf "$ipk_file" -C "$pkg_verify_dir"
+
+            # debian-binary 内容必须为 2.0
+            if [ "$(cat "${pkg_verify_dir}/debian-binary")" != '2.0' ]; then
+              echo "debian-binary 内容不正确: ${pkg_name}" >&2
+              exit 1
+            fi
+
+            # control 字段校验
+            mkdir -p "${pkg_verify_dir}/control"
+            tar -xzf "${pkg_verify_dir}/control.tar.gz" -C "${pkg_verify_dir}/control"
+            control_file="${pkg_verify_dir}/control/control"
+            if [ ! -s "$control_file" ]; then
+              echo "control 文件缺失: ${pkg_name}" >&2
+              exit 1
+            fi
+            if ! grep -qxF -- "Package: ${pkg_name}" "$control_file"; then
+              echo "control 中的 Package 字段不正确: ${pkg_name}" >&2
+              exit 1
+            fi
+            if ! grep -qxF -- "Version: ${UPSTREAM_VERSION}-${RELEASE}" "$control_file"; then
+              echo "control 中的 Version 字段不正确: ${pkg_name}" >&2
+              exit 1
+            fi
+            if ! grep -qxF -- 'Architecture: all' "$control_file"; then
+              echo "control 中的 Architecture 字段不正确: ${pkg_name}" >&2
+              exit 1
+            fi
+            echo "control 字段校验通过: ${pkg_name}"
+
+            # 数据文件路径与内容校验
+            tar -tzf "${pkg_verify_dir}/data.tar.gz" > "${verify_dir}/${pkg_name}.data.list"
+            if ! grep -qxF -- "./${INSTALL_DIR}/${data_file}" "${verify_dir}/${pkg_name}.data.list"; then
+              echo "数据包内路径不正确: ./${INSTALL_DIR}/${data_file}" >&2
+              exit 1
+            fi
+            mkdir -p "${pkg_verify_dir}/data"
+            tar -xzf "${pkg_verify_dir}/data.tar.gz" -C "${pkg_verify_dir}/data"
+            installed_file="${pkg_verify_dir}/data/${INSTALL_DIR}/${data_file}"
+            if [ ! -s "$installed_file" ]; then
+              echo "数据包内文件为空: ${installed_file}" >&2
+              exit 1
+            fi
+            installed_sum="$(sha256sum "$installed_file" | awk '{ print $1 }')"
+            source_sum="$(sha256sum "${download_dir}/${data_file}" | awk '{ print $1 }')"
+            if [ "$installed_sum" != "$source_sum" ]; then
+              echo "安装包内数据文件与上游不一致: ${data_file}" >&2
+              exit 1
+            fi
+            echo "安装包完整性校验通过: ${pkg_name} 数据文件 ${data_file}"
+
+            # 文件权限校验，数据文件应为 0644
+            installed_mode="$(stat -c '%a' "$installed_file")"
+            if [ "$installed_mode" != '644' ]; then
+              echo "数据包内文件权限不正确: ${installed_file} 权限 ${installed_mode}" >&2
+              exit 1
+            fi
+          done
+
+      - name: 部署安装包并精确清理旧版本
+        if: steps.check.outputs.skip == 'false'
+        id: deploy
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          build_dir="$BUILD_ROOT/build"
+          geoip_ipk="v2ray-geoip_${UPSTREAM_VERSION}_all.ipk"
+          geosite_ipk="v2ray-geosite_${UPSTREAM_VERSION}_all.ipk"
+
+          for arch_dir in "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"; do
+            echo "处理目录: ${arch_dir}"
+            mkdir -p "$arch_dir"
+            cp -f "${build_dir}/${geoip_ipk}" "${arch_dir}/${geoip_ipk}"
+            cp -f "${build_dir}/${geosite_ipk}" "${arch_dir}/${geosite_ipk}"
+
+            # 安全删除：仅清理本工作流产出的旧版本安装包，其他文件一律不碰
+            echo "清理 ${arch_dir} 下的旧版本安装包"
+            find "$arch_dir" -maxdepth 1 -type f -name 'v2ray-geoip_*_all.ipk' ! -name "$geoip_ipk" -print -delete
+            find "$arch_dir" -maxdepth 1 -type f -name 'v2ray-geosite_*_all.ipk' ! -name "$geosite_ipk" -print -delete
+
+            echo "目录 ${arch_dir} 当前内容:"
+            ls -l "$arch_dir"
+          done
+
+      - name: 提交并推送到本仓库
+        if: steps.check.outputs.skip == 'false'
+        id: commit
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 只添加两个架构目录，避免把临时文件带入提交
+          git add -- "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"
 
           if git diff --cached --quiet; then
-            echo "无文件变更，跳过提交。"
-          else
-            COMMIT_MSG="🔄自动构建 v2ray-rules-dat ${TAG} | ${BEIJING_TIME}(北京时间)"
-            echo "提交信息: $COMMIT_MSG"
-            git commit -m "$COMMIT_MSG"
-            git push
-            echo "推送成功。"
+            echo "仓库内容无变化，无需提交"
+            exit 0
           fi
 
+          beijing_time="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          commit_message="🔄自动构建 v2ray-rules-dat ${UPSTREAM_VERSION} | ${beijing_time}(北京时间)"
+          git commit -m "$commit_message"
+          echo "提交信息: ${commit_message}"
+
+          for attempt in 1 2 3; do
+            echo "第 ${attempt} 次推送"
+            if git push origin "HEAD:${TARGET_BRANCH}"; then
+              echo "推送成功"
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "推送失败，已达最大重试次数" >&2
+              exit 1
+            fi
+            git fetch origin "$TARGET_BRANCH"
+            git rebase "origin/${TARGET_BRANCH}"
+          done
+
       - name: 清理临时文件
+        # 无论成功失败都清理临时文件
         if: always()
+        continue-on-error: true
         run: |
-          echo "正在清理临时文件..."
-          rm -rf "$TMP_WORK_DIR"
-          echo "临时文件清理完成。"
+          rm -rf "$BUILD_ROOT"
+          echo "临时文件已清理: ${BUILD_ROOT}"
