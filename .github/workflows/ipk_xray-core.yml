@@ -234,15 +234,18 @@ jobs:
           for out_dir in "run/x86_64/xray-core" "run/aarch64/xray-core"; do
             if [ -d "$out_dir" ]; then
               cd "$out_dir"
-              # 精确匹配 xray-core_*.ipk，只删除非当前版本
+              # 精确匹配 xray-core_*.ipk，只删除非当前版本（用 bash 内置模式匹配避免 grep SIGPIPE）
               for f in xray-core_*.ipk; do
                 [ -e "$f" ] || continue
-                if echo "$f" | grep -qF "_${ver}_"; then
+                case "$f" in
+                  *"_${ver}_"*)
                   echo "  保留：$f"
-                else
+                    ;;
+                  *)
                   echo "  删除：$f"
                   rm -f -- "$f"
-                fi
+                    ;;
+                esac
               done
               cd - >/dev/null
             fi
@@ -255,7 +258,10 @@ jobs:
       - name: IPK 完整性校验
         if: steps.check.outputs.need_build == 'true'
         run: |
-          set -euo pipefail
+          # 注意：这里不要加 pipefail。校验过程中会有大量 `tar | grep -q` / `tar | dd` 管道，
+          # grep/dd 提前关闭时上游 tar 会收到 SIGPIPE，这属于正常情况，不是失败。
+          # 我们用 all_ok 变量显式校验结果即可。
+          set -eu
           ver="${{ steps.get_version.outputs.latest_version }}"
           all_ok=true
 
@@ -322,8 +328,12 @@ jobs:
               all_ok=false; continue
             fi
 
-            # 7.7 data.tar.gz 中的 xray 应是可执行 ELF（用 od 代替 xxd 以兼容更多环境）
-            xray_header=$(tar -xzf "$ipk_path" -O ./data.tar.gz | tar -xzO ./usr/bin/xray | head -c 4 | od -An -tx1 | tr -d ' \n')
+            # 7.7 data.tar.gz 中的 xray 应是可执行 ELF（用 dd 取前 4 字节，避免 head 触发 SIGPIPE）
+            # 注意：不能用 `... | head -c 4`，在 pipefail 下 head 提前关闭管道会导致 tar 收到 SIGPIPE 并 exit 2
+            xray_header=$(tar -xzf "$ipk_path" -O ./data.tar.gz \
+                            | (tar -xzO ./usr/bin/xray 2>/dev/null || true) \
+                            | dd bs=1 count=4 status=none 2>/dev/null \
+                            | od -An -tx1 | tr -d ' \n')
             echo "  xray 文件头(hex)：${xray_header}"
             if [ "$xray_header" != "7f454c46" ]; then
               echo "❌ 不是有效的 ELF 文件（header: ${xray_header}）"
