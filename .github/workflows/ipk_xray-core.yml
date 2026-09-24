@@ -359,7 +359,7 @@ jobs:
         run: |
           set -euo pipefail
           ver="${{ steps.get_version.outputs.latest_version }}"
-          bj_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')
+          bj_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -369,7 +369,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "⏭️  无文件变更，跳过提交。"
           else
-            commit_msg="🔄自动构建：Xray-core ${ver} | ${bj_time}(北京时间)"
+            commit_msg="🔄自动构建 Xray-core ${ver} | ${bj_time}(北京时间)"
             git commit -m "$commit_msg"
             git push
             echo "✅ 已推送：${commit_msg}"
