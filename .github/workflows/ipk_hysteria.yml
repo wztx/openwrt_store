@@ -46,7 +46,7 @@ jobs:
       - name: "获取最新版本号（含预发布版）"
         run: |
           RELEASE_JSON=$(curl -sL -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "https://api.github.com/repos/HyNetworks/hysteria/releases")
-          VERSION=$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"app\/(v[^"]+)".*/\1/')
+          VERSION=$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"app\/v([^"]+)".*/\1/')
           PRERELEASE=$(echo "${RELEASE_JSON}" | grep -m1 '"prerelease":' | sed -E 's/.*"prerelease": *(true|false).*/\1/')
           if [ -z "${VERSION}" ]; then
             echo "错误：无法获取版本号"
@@ -88,9 +88,9 @@ jobs:
         run: |
           mkdir -p "${BUILD_DIR}/bin"
           echo "下载 amd64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2F${VERSION}/hysteria-linux-amd64" -o "${BUILD_DIR}/bin/hysteria-amd64" || exit 1
+          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2Fv${VERSION}/hysteria-linux-amd64" -o "${BUILD_DIR}/bin/hysteria-amd64" || exit 1
           echo "下载 arm64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2F${VERSION}/hysteria-linux-arm64" -o "${BUILD_DIR}/bin/hysteria-arm64" || exit 1
+          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2Fv${VERSION}/hysteria-linux-arm64" -o "${BUILD_DIR}/bin/hysteria-arm64" || exit 1
           echo "下载完成"
           ls -lh "${BUILD_DIR}/bin/"
 
@@ -128,7 +128,7 @@ jobs:
           # 校验
           IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
           echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1048576 ]; then
+          if [ "${IPK_SIZE}" -lt 1024 ]; then
             echo "错误：IPK文件过小（小于1MB），构建可能失败"
             exit 1
           fi
@@ -181,7 +181,7 @@ jobs:
           # 校验
           IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
           echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1048576 ]; then
+          if [ "${IPK_SIZE}" -lt 1024 ]; then
             echo "错误：IPK文件过小（小于1MB），构建可能失败"
             exit 1
           fi
@@ -211,8 +211,8 @@ jobs:
               for f in "${DIR}"/*.ipk; do
                 [ -f "$f" ] || continue
                 fname=$(basename "$f")
-                # 精确匹配 hysteria_版本号-发布号_架构.ipk 格式
-                if echo "${fname}" | grep -qE '^hysteria_v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+_(x86_64|aarch64)\.ipk$'; then
+                # 精确匹配 hysteria_版本号-发布号_架构.ipk 格式（无v前缀）
+                if echo "${fname}" | grep -qE '^hysteria_[0-9]+\.[0-9]+\.[0-9]+-[0-9]+_(x86_64|aarch64)\.ipk$'; then
                   if [ "${fname}" != "${KEEP_X86}" ] && [ "${fname}" != "${KEEP_AARCH64}" ]; then
                     echo "删除旧版本: $f"
                     rm -f "$f"
@@ -229,7 +229,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "run/x86_64/hysteria-core/*.ipk" "run/aarch64/hysteria-core/*.ipk"
-          COMMIT_MSG="🔄自动构建 Hysteria ${VERSION_TYPE} ${VERSION} | ${BEIJING_TIME}(北京时间)"
+          COMMIT_MSG="🔄自动构建 Hysteria ${VERSION_TYPE} v${VERSION} | ${BEIJING_TIME}(北京时间)"
           echo "提交信息: ${COMMIT_MSG}"
           git commit -m "${COMMIT_MSG}" || echo "无变更需要提交"
           git push
