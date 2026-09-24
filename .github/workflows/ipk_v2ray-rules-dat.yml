@@ -238,7 +238,7 @@ jobs:
           for entry in "v2ray-geoip:geoip.dat" "v2ray-geosite:geosite.dat"; do
             pkg_name="${entry%%:*}"
             data_file="${entry##*:}"
-            ipk_file="${build_dir}/${pkg_name}_${UPSTREAM_VERSION}_all.ipk"
+            ipk_file="${build_dir}/${pkg_name}_${package_version}_all.ipk"
 
             if [ ! -s "$ipk_file" ]; then
               echo "安装包不存在或为空: ${ipk_file}" >&2
@@ -333,8 +333,8 @@ jobs:
         run: |
           set -euo pipefail
           build_dir="$BUILD_ROOT/build"
-          geoip_ipk="v2ray-geoip_${UPSTREAM_VERSION}_all.ipk"
-          geosite_ipk="v2ray-geosite_${UPSTREAM_VERSION}_all.ipk"
+          geoip_ipk="v2ray-geoip_${package_version}_all.ipk"
+          geosite_ipk="v2ray-geosite_${package_version}_all.ipk"
 
           for arch_dir in "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"; do
             echo "处理目录: ${arch_dir}"
