@@ -1,45 +1,50 @@
 # ============================================================
-# sing-box OpenWrt IPK 自动构建与同步工作流（修正版）
-# 功能：每日定时检查上游最新版本，自动构建 x86_64 / aarch64 架构 IPK 包
-# 环境：OpenWrt 24.10
-# 外层格式：tar.gz（含 debian-binary / control.tar.gz / data.tar.gz）
+# sing-box OpenWrt IPK 自动构建与同步工作流（v4）
+# 功能：每天定时检查上游最新版本，从官方 OpenWrt IPK 中提取 sing-box 二进制，
+#       重新打包为 x86_64 / aarch64 两个架构的 IPK，并自动提交回本仓库
+# 使用环境：OpenWrt 24.10
+# 下载源：https://api.github.com/repos/SagerNet/sing-box/releases/latest
+# 打包规范：与 OpenWrt SDK scripts/ipkg-build 完全一致（外层 tar.gz）
 # ============================================================
 
 name: 自动构建 sing-box IPK 安装包
 
 on:
+  # 每天 UTC 22:05（北京时间 06:05）自动检查上游版本
   schedule:
-    - cron: '5 22 * * *'	# 定时触发：每天 UTC 22:05（北京时间 06:05）
+    - cron: '5 22 * * *'
+  # 手动触发，支持强制更新
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制更新（忽略版本检查直接重新构建）'
+        description: '是否强制更新（忽略版本对比，直接重新下载并构建）'
         required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+        default: false
+        type: boolean
 
+# 并发限制：同一时刻只允许一个实例运行，后到的排队等待而不是取消正在运行的实例
 concurrency:
-  group: 'sing-box-ipk-build'
+  group: sing-box-ipk-build
   cancel-in-progress: false
 
+# 工作权限：推送代码 + 清理本工作流产出的旧文件
 permissions:
   contents: write
 
 jobs:
   build:
-    name: 检查并构建 IPK 安装包
+    name: 检查上游版本并构建 IPK
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       UPSTREAM_API: "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
       UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       PKG_NAME: "sing-box"
       PKG_RELEASE: "1"
-      OUT_DIR_AMD64: "run/x86_64/sing-box"
+      ARCH_X86_64: "x86_64"
+      ARCH_AARCH64: "aarch64"
+      OUT_DIR_X86_64: "run/x86_64/sing-box"
       OUT_DIR_AARCH64: "run/aarch64/sing-box"
 
     steps:
@@ -54,68 +59,118 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "正在请求上游版本信息..."
-          # 将 API 响应写入临时文件后用 grep 读取，彻底规避管道 SIGPIPE+pipefail 陷阱
+          echo "正在请求上游版本信息: ${UPSTREAM_API}"
+
           RESP_FILE="$(mktemp)"
           trap 'rm -f "$RESP_FILE"' EXIT
+
+          # 响应先落到文件，再用 jq / grep 读取，彻底规避管道 SIGPIPE + pipefail 陷阱
           curl -sL --fail --retry 3 --retry-delay 2 \
             -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: ${{ env.UA }}" \
+            -A "$UA" \
             -o "$RESP_FILE" \
-            "${{ env.UPSTREAM_API }}"
+            "$UPSTREAM_API"
 
-          # grep 直接读文件，无管道生产者，不存在 SIGPIPE 问题
-          LATEST_TAG="$(grep -m1 -oP '"tag_name":\s*"\K[^"]+' "$RESP_FILE")"
-          LATEST_VER="${LATEST_TAG#v}"
-          echo "上游最新版本: ${LATEST_VER}"
-          if [ -z "$LATEST_VER" ]; then
-            echo "::error::获取版本号失败"
-            exit 1
+          if command -v jq >/dev/null 2>&1; then
+            echo "使用 jq 解析上游响应"
+            LATEST_TAG="$(jq -r '.tag_name // empty' "$RESP_FILE")"
+            AMD64_URL="$(jq -r 'first(.assets[] | select(.name | test("_openwrt_x86_64\\.ipk$")) | .browser_download_url) // empty' "$RESP_FILE")"
+            AARCH64_URL="$(jq -r 'first(.assets[] | select(.name | test("_openwrt_aarch64_generic\\.ipk$")) | .browser_download_url) // empty' "$RESP_FILE")"
+            AMD64_SIZE="$(jq -r 'first(.assets[] | select(.name | test("_openwrt_x86_64\\.ipk$")) | .size) // 0' "$RESP_FILE")"
+            AARCH64_SIZE="$(jq -r 'first(.assets[] | select(.name | test("_openwrt_aarch64_generic\\.ipk$")) | .size) // 0' "$RESP_FILE")"
+          else
+            echo "未检测到 jq，回退到 grep 解析"
+            LATEST_TAG="$(grep -m1 -oP '"tag_name":\s*"\K[^"]+' "$RESP_FILE")"
+            AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+_openwrt_x86_64\.ipk' "$RESP_FILE")"
+            AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+_openwrt_aarch64_generic\.ipk' "$RESP_FILE")"
+            AMD64_SIZE="0"
+            AARCH64_SIZE="0"
           fi
 
-          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_openwrt_x86_64\.ipk' "$RESP_FILE")"
-          AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_openwrt_aarch64_generic\.ipk' "$RESP_FILE")"
+          # 去掉 tag 前缀 v，得到纯版本号
+          LATEST_VER="${LATEST_TAG#v}"
 
+          if [ -z "$LATEST_VER" ]; then
+            echo "::error::获取上游版本号失败"
+            exit 1
+          fi
           if [ -z "$AMD64_URL" ]; then
-            echo "::error::未找到 amd64 二进制包下载链接"
+            echo "::error::未找到 openwrt_x86_64.ipk 下载链接"
             exit 1
           fi
           if [ -z "$AARCH64_URL" ]; then
-            echo "::error::未找到 aarch64 二进制包下载链接"
+            echo "::error::未找到 openwrt_aarch64_generic.ipk 下载链接"
             exit 1
           fi
-          echo "amd64 链接: ${AMD64_URL}"
-          echo "aarch64 链接: ${AARCH64_URL}"
 
-          echo "latest_ver=${LATEST_VER}" >> "$GITHUB_OUTPUT"
-          echo "amd64_url=${AMD64_URL}" >> "$GITHUB_OUTPUT"
-          echo "aarch64_url=${AARCH64_URL}" >> "$GITHUB_OUTPUT"
+          echo "上游最新版本: ${LATEST_VER}"
+          echo "x86_64 下载链接: ${AMD64_URL}"
+          echo "aarch64 下载链接: ${AARCH64_URL}"
+          echo "x86_64 预期大小: ${AMD64_SIZE} 字节"
+          echo "aarch64 预期大小: ${AARCH64_SIZE} 字节"
+
+          {
+            echo "latest_ver=${LATEST_VER}"
+            echo "amd64_url=${AMD64_URL}"
+            echo "aarch64_url=${AARCH64_URL}"
+            echo "amd64_size=${AMD64_SIZE}"
+            echo "aarch64_size=${AARCH64_SIZE}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: 版本对比检查
         id: check_skip
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           FORCE="${{ github.event.inputs.force_update }}"
           VER="${{ steps.get_version.outputs.latest_ver }}"
-          IPK_AMD64="${{ env.OUT_DIR_AMD64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_x86_64.ipk"
-          IPK_AARCH64="${{ env.OUT_DIR_AARCH64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_aarch64.ipk"
-          echo "目标文件 x86_64: ${IPK_AMD64}"
+
+          IPK_X86_64="${OUT_DIR_X86_64}/${PKG_NAME}_${VER}-${PKG_RELEASE}_${ARCH_X86_64}.ipk"
+          IPK_AARCH64="${OUT_DIR_AARCH64}/${PKG_NAME}_${VER}-${PKG_RELEASE}_${ARCH_AARCH64}.ipk"
+
+          echo "目标文件 x86_64: ${IPK_X86_64}"
           echo "目标文件 aarch64: ${IPK_AARCH64}"
+
+          # 纯文件名对比：两个架构的文件名全部存在即跳过
           if [ "$FORCE" = "true" ]; then
-            echo "手动触发强制更新，跳过版本检查"
-            echo "should_skip=false" >> "$GITHUB_OUTPUT"
-          elif [ -f "$IPK_AMD64" ] && [ -f "$IPK_AARCH64" ]; then
-            echo "两个架构的 ${VER} 版本 IPK 均已存在，跳过构建"
-            echo "should_skip=true" >> "$GITHUB_OUTPUT"
+            echo "手动触发强制更新，跳过版本对比"
+            SKIP="false"
+          elif [ -f "$IPK_X86_64" ] && [ -f "$IPK_AARCH64" ]; then
+            echo "版本 ${VER} 的两个架构 IPK 均已存在，本次跳过构建"
+            SKIP="true"
           else
             echo "发现新版本 ${VER}，开始构建"
-            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            SKIP="false"
           fi
-          echo "ipk_amd64=${IPK_AMD64}" >> "$GITHUB_OUTPUT"
-          echo "ipk_aarch64=${IPK_AARCH64}" >> "$GITHUB_OUTPUT"
 
-      - name: 下载并构建 IPK 包
+          {
+            echo "should_skip=${SKIP}"
+            echo "ipk_x86_64=${IPK_X86_64}"
+            echo "ipk_aarch64=${IPK_AARCH64}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 清理旧版本 IPK 文件
+        if: steps.check_skip.outputs.should_skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 安全删除：只清理本工作流产出的 sing-box_*.ipk，绝不触碰目录内其它任何文件
+          clean_old_ipk() {
+            local dir="$1"
+            mkdir -p "$dir"
+            local before after
+            before="$(find "$dir" -maxdepth 1 -type f -name "${PKG_NAME}_*.ipk" | wc -l)"
+            find "$dir" -maxdepth 1 -type f -name "${PKG_NAME}_*.ipk" -delete
+            after="$(find "$dir" -maxdepth 1 -type f -name "${PKG_NAME}_*.ipk" | wc -l)"
+            echo "目录 ${dir}: 清理前 ${before} 个旧 IPK，清理后剩余 ${after} 个"
+          }
+
+          clean_old_ipk "$OUT_DIR_X86_64"
+          clean_old_ipk "$OUT_DIR_AARCH64"
+          echo "旧版本清理完成"
+
+      - name: 下载官方 IPK 并重新打包
         if: steps.check_skip.outputs.should_skip == 'false'
         id: build
         shell: bash
@@ -123,13 +178,16 @@ jobs:
           VER: ${{ steps.get_version.outputs.latest_ver }}
           AMD64_URL: ${{ steps.get_version.outputs.amd64_url }}
           AARCH64_URL: ${{ steps.get_version.outputs.aarch64_url }}
-          TARGET_IPK_AMD64: ${{ steps.check_skip.outputs.ipk_amd64 }}
+          AMD64_SIZE: ${{ steps.get_version.outputs.amd64_size }}
+          AARCH64_SIZE: ${{ steps.get_version.outputs.aarch64_size }}
+          TARGET_IPK_X86_64: ${{ steps.check_skip.outputs.ipk_x86_64 }}
           TARGET_IPK_AARCH64: ${{ steps.check_skip.outputs.ipk_aarch64 }}
         run: |
           set -euo pipefail
 
           TMPDIR="$(mktemp -d)"
           CLEANED="false"
+          # 无论成功失败都清理临时文件
           cleanup() {
             if [ "$CLEANED" = "false" ]; then
               CLEANED="true"
@@ -140,188 +198,247 @@ jobs:
           }
           trap cleanup EXIT INT TERM
 
-          AMD64_FILE="${TMPDIR}/sing-box-x86_64.ipk"
-          AARCH64_FILE="${TMPDIR}/sing-box-generic.ipk"
-          WORK_AMD64="${TMPDIR}/build-amd64"
-          WORK_AARCH64="${TMPDIR}/build-aarch64"
-          mkdir -p "$WORK_AMD64" "$WORK_AARCH64"
+          # 统一归档时间戳，配合 gzip -n 保证归档可重现
+          MTIME="@$(date -u +%s)"
 
-          echo "正在下载 x86_64 二进制包..."
-          curl -sL --fail --retry 3 --retry-delay 2 \
-            -H "User-Agent: ${{ env.UA }}" \
-            -o "$AMD64_FILE" "$AMD64_URL"
+          # ---------- 工具函数 ----------
+          # 校验下载文件大小，防止下载超时导致文件不完整
+          check_size() {
+            local file="$1"
+            local expected="$2"
+            local label="$3"
+            if [ -z "$expected" ] || [ "$expected" = "0" ]; then
+              echo "跳过 ${label} 大小校验（上游未提供大小信息）"
+              return 0
+            fi
+            local actual
+            actual="$(stat -c%s "$file")"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::${label} 下载大小不符：实际 ${actual} 字节 / 预期 ${expected} 字节"
+              exit 1
+            fi
+            echo "${label} 下载大小校验通过（${actual} 字节）"
+          }
 
-          echo "正在下载 aarch64 二进制包..."
-          curl -sL --fail --retry 3 --retry-delay 2 \
-            -H "User-Agent: ${{ env.UA }}" \
-            -o "$AARCH64_FILE" "$AARCH64_URL"
-
-          echo "正在解压 x86_64 包..."
-          tar -xzf "$AMD64_FILE" -C "$WORK_AMD64" --strip-components=1
-
-          echo "正在解压 aarch64 包..."
-          set +e
-          tar -xf "$AARCH64_FILE" -C "$WORK_AARCH64" --zstd usr/bin/sing-box 2>/dev/null
-          TAR_RC=$?
-          set -e
-          if [ "$TAR_RC" -ne 0 ] || [ ! -f "${WORK_AARCH64}/usr/bin/sing-box" ]; then
-            echo "tar --zstd 解压失败，尝试 zstd 管道方式..."
-            mkdir -p "${WORK_AARCH64}/usr/bin"
-            # 管道场景：tar 读完所有数据后退出，zstd 在写完数据后才退出，不会触发 SIGPIPE
-            zstd -d -c "$AARCH64_FILE" | tar -xf - -C "$WORK_AARCH64" usr/bin/sing-box
-          fi
-
-          AMD64_BIN="${WORK_AMD64}/sing-box"
-          AARCH64_BIN="${WORK_AARCH64}/usr/bin/sing-box"
-
-          # ELF 头校验：使用 od -An -tx1 替代 xxd -p（ubuntu-latest 默认无 xxd）
+          # ELF 头校验：使用 od -An -tx1（ubuntu-latest 默认没有 xxd）
           check_elf() {
             local bin_file="$1"
-            local arch_name="$2"
-            test -f "$bin_file" || { echo "::error::${arch_name} sing-box 二进制文件不存在"; exit 1; }
-            # head 作为生产者写完 4 字节即正常退出，od 读完输入退出，无 SIGPIPE 风险
-            local magic
+            local label="$2"
+            local want_machine="$3"
+            if [ ! -f "$bin_file" ]; then
+              echo "::error::${label} sing-box 二进制文件不存在: ${bin_file}"
+              exit 1
+            fi
+            local magic class machine
             magic="$(head -c 4 "$bin_file" | od -An -tx1 | tr -d ' \n')"
-            local class
             class="$(head -c 5 "$bin_file" | tail -c 1 | od -An -tx1 | tr -d ' \n')"
+            machine="$(head -c 20 "$bin_file" | tail -c 2 | od -An -tx1 | tr -d ' \n')"
             if [ "$magic" != "7f454c46" ]; then
-              echo "::error::${arch_name} 文件 ELF 魔数校验失败: ${magic}"
+              echo "::error::${label} ELF 魔数校验失败: ${magic}"
               exit 1
             fi
             if [ "$class" != "02" ]; then
-              echo "::error::${arch_name} 文件不是 64 位 ELF (class=${class})"
+              echo "::error::${label} 不是 64 位 ELF: class=${class}"
               exit 1
             fi
-            echo "${arch_name} ELF 校验通过"
+            if [ "$machine" != "$want_machine" ]; then
+              echo "::error::${label} ELF 机器类型不匹配: 期望 ${want_machine} 实际 ${machine}"
+              exit 1
+            fi
+            echo "${label} ELF 头校验通过（magic=${magic} class=${class} machine=${machine}）"
           }
 
+          # ---------- 下载官方 IPK ----------
+          echo "正在下载 x86_64 官方 IPK..."
+          curl -sL --fail --retry 3 --retry-delay 2 -A "$UA" \
+            -o "${TMPDIR}/x86_64.ipk" "$AMD64_URL"
+
+          echo "正在下载 aarch64 官方 IPK..."
+          curl -sL --fail --retry 3 --retry-delay 2 -A "$UA" \
+            -o "${TMPDIR}/aarch64.ipk" "$AARCH64_URL"
+
+          echo "校验下载文件大小..."
+          check_size "${TMPDIR}/x86_64.ipk" "$AMD64_SIZE" "x86_64"
+          check_size "${TMPDIR}/aarch64.ipk" "$AARCH64_SIZE" "aarch64"
+
+          # ---------- 解包：外层 tar.gz -> data.tar.gz -> usr/bin/sing-box ----------
+          echo "正在解包 x86_64 官方 IPK..."
+          mkdir -p "${TMPDIR}/x86_64" "${TMPDIR}/aarch64"
+          tar -xzf "${TMPDIR}/x86_64.ipk" -C "${TMPDIR}/x86_64"
+          tar -xzf "${TMPDIR}/x86_64/data.tar.gz" -C "${TMPDIR}/x86_64"
+
+          echo "正在解包 aarch64 官方 IPK..."
+          tar -xzf "${TMPDIR}/aarch64.ipk" -C "${TMPDIR}/aarch64"
+          tar -xzf "${TMPDIR}/aarch64/data.tar.gz" -C "${TMPDIR}/aarch64"
+
+          X86_64_BIN="${TMPDIR}/x86_64/usr/bin/${PKG_NAME}"
+          AARCH64_BIN="${TMPDIR}/aarch64/usr/bin/${PKG_NAME}"
+
           echo "校验 x86_64 ELF 头..."
-          check_elf "$AMD64_BIN" "x86_64"
+          check_elf "$X86_64_BIN" "x86_64" "3e00"
           echo "校验 aarch64 ELF 头..."
-          check_elf "$AARCH64_BIN" "aarch64"
+          check_elf "$AARCH64_BIN" "aarch64" "b700"
 
-          mkdir -p "${{ env.OUT_DIR_AMD64 }}" "${{ env.OUT_DIR_AARCH64 }}"
-
-          echo "清理旧版本 sing-box IPK 文件..."
-          find "${{ env.OUT_DIR_AMD64 }}" -maxdepth 1 -type f -name "${{ env.PKG_NAME }}_*.ipk" -delete 2>/dev/null || true
-          find "${{ env.OUT_DIR_AARCH64 }}" -maxdepth 1 -type f -name "${{ env.PKG_NAME }}_*.ipk" -delete 2>/dev/null || true
-          echo "旧版本清理完成"
-
-          # ---------- IPK 构建函数（外层 tar.gz，内部结构对齐 ipkg-build 规范） ----------
+          # ---------- IPK 打包：与 OpenWrt SDK scripts/ipkg-build 完全一致 ----------
           build_ipk() {
             local ARCH="$1"
             local BIN_SRC="$2"
             local IPK_OUT="$3"
-            local IPK_VER="${VER}-${{ env.PKG_RELEASE }}"
-            local IPK_TMP="${TMPDIR}/ipk-${ARCH}"
+            local PKG_VER="${VER}-${PKG_RELEASE}"
+            local WORK="${TMPDIR}/pkg-${ARCH}"
 
-            # 关键修复：将输出路径转为绝对路径，防止子shell cd后相对路径漂移
+            # 输出路径绝对化，防止子 shell 内 cd 之后相对路径漂移
             case "$IPK_OUT" in
               /*) ;;
               *) IPK_OUT="${PWD}/${IPK_OUT}" ;;
             esac
-            # 确保输出目录存在（在cd到临时目录之前创建）
             mkdir -p "$(dirname "$IPK_OUT")"
 
-            rm -rf "$IPK_TMP"
-            mkdir -p "${IPK_TMP}/data/usr/bin"
-            mkdir -p "${IPK_TMP}/control"
+            rm -rf "$WORK"
+            mkdir -p "${WORK}/data/usr/bin" "${WORK}/control"
 
-            cp "$BIN_SRC" "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}"
-            chmod 0755 "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}"
+            # 只提取 sing-box 二进制，不改名，安装路径 usr/bin/
+            cp "$BIN_SRC" "${WORK}/data/usr/bin/${PKG_NAME}"
+            chmod 0755 "${WORK}/data/usr/bin/${PKG_NAME}"
 
-            printf '2.0\n' > "${IPK_TMP}/debian-binary"
-
-            # 生成 control 文件
-            local INST_SIZE
-            INST_SIZE="$(du -k "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}" | cut -f1)"
-            {
-              printf 'Package: %s\n' "${{ env.PKG_NAME }}"
-              printf 'Version: %s\n' "$IPK_VER"
-              printf 'Architecture: %s\n' "$ARCH"
-              printf 'Maintainer: OpenWrt Auto Build\n'
-              printf 'Installed-Size: %s\n' "$INST_SIZE"
-              printf 'Section: net\n'
-              printf 'Priority: optional\n'
-              printf 'Homepage: https://github.com/SagerNet/sing-box\n'
-              printf 'Description: The universal proxy platform\n'
-              printf ' sing-box is a universal proxy platform that supports multiple\n'
-              printf ' protocols. This package is built automatically via GitHub Actions.\n'
-            } > "${IPK_TMP}/control/control"
-
-            # 生成 postinst（使用 printf 避免 heredoc 缩进引发 YAML 解析陷阱）
-            printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || true\nexit 0\n' > "${IPK_TMP}/control/postinst"
-            chmod 0755 "${IPK_TMP}/control/postinst"
-
-            # 子 tar 打包：严格按 ( cd dir && tar -czf out.tar.gz . ) 方式，避免路径遗漏
+            # 1) data.tar.gz：gnu 格式 + 数字属主 + 按名排序 + 保留目录项，gzip -n 去掉时间戳
             echo "打包 ${ARCH} data.tar.gz..."
-            ( cd "${IPK_TMP}/data" && tar --format=gnu --owner=0 --group=0 -czf "${IPK_TMP}/data.tar.gz" . )
+            ( cd "${WORK}/data" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name \
+                -cpf - --mtime="${MTIME}" . | gzip -n - > "${WORK}/data.tar.gz" )
 
+            # 2) Installed-Size 取 data.tar.gz 解压后的字节数（与 ipkg-build 保持一致）
+            local INSTALLED_SIZE
+            INSTALLED_SIZE="$(zcat "${WORK}/data.tar.gz" | wc -c)"
+            INSTALLED_SIZE="${INSTALLED_SIZE// /}"
+
+            # 3) 生成 control，Version 调整为 版本号-发布号
+            printf 'Package: %s\n' "${PKG_NAME}" > "${WORK}/control/control"
+            printf 'Version: %s\n' "${PKG_VER}" >> "${WORK}/control/control"
+            printf 'Architecture: %s\n' "${ARCH}" >> "${WORK}/control/control"
+            printf 'Maintainer: OpenWrt Auto Build <actions@users.noreply.github.com>\n' >> "${WORK}/control/control"
+            printf 'Installed-Size: %s\n' "${INSTALLED_SIZE}" >> "${WORK}/control/control"
+            printf 'Section: net\n' >> "${WORK}/control/control"
+            printf 'Priority: optional\n' >> "${WORK}/control/control"
+            printf 'Homepage: https://github.com/SagerNet/sing-box\n' >> "${WORK}/control/control"
+            printf 'Description: The universal proxy platform.\n' >> "${WORK}/control/control"
+            printf ' sing-box is a universal proxy platform which supports multiple\n' >> "${WORK}/control/control"
+            printf ' protocols. Automatically repacked from the official OpenWrt IPK.\n' >> "${WORK}/control/control"
+            chmod 0644 "${WORK}/control/control"
+
+            # 4) control.tar.gz
             echo "打包 ${ARCH} control.tar.gz..."
-            ( cd "${IPK_TMP}/control" && tar --format=gnu --owner=0 --group=0 -czf "${IPK_TMP}/control.tar.gz" . )
+            ( cd "${WORK}/control" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name \
+                -cf - --mtime="${MTIME}" . | gzip -n - > "${WORK}/control.tar.gz" )
 
-            # 外层打包改用 tar.gz（按要求），内部顺序对齐规范：debian-binary → control → data
-            echo "打包 ${ARCH} 最终 IPK (tar.gz 外层)..."
+            # 5) debian-binary，内容固定为 2.0 加换行
+            printf '2.0\n' > "${WORK}/debian-binary"
+
+            # 6) 外层 tar.gz，成员与 ipkg-build 一致（--sort=name 会排成 control / data / debian）
+            echo "打包 ${ARCH} 最终 IPK（外层 tar.gz）..."
             rm -f "$IPK_OUT"
-            ( cd "$IPK_TMP" && tar --owner=0 --group=0 -czf "$IPK_OUT" ./debian-binary ./control.tar.gz ./data.tar.gz )
+            ( cd "${WORK}" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name \
+                -cf - --mtime="${MTIME}" ./debian-binary ./data.tar.gz ./control.tar.gz | gzip -n - > "$IPK_OUT" )
 
             echo "${ARCH} IPK 构建完成: ${IPK_OUT}"
           }
 
-          build_ipk "x86_64" "$AMD64_BIN" "$TARGET_IPK_AMD64"
-          build_ipk "aarch64" "$AARCH64_BIN" "$TARGET_IPK_AARCH64"
+          # ---------- IPK 完整性校验 ----------
+          verify_ipk() {
+            local ipk="$1"
+            local label="$2"
+            local bin_src="$3"
+            local want_ver="$4"
+
+            if [ ! -f "$ipk" ]; then
+              echo "::error::${label} IPK 文件缺失: ${ipk}"
+              exit 1
+            fi
+
+            local size
+            size="$(stat -c%s "$ipk")"
+            if [ "$size" -lt 1000000 ]; then
+              echo "::error::${label} IPK 文件异常过小（${size} 字节）: ${ipk}"
+              exit 1
+            fi
+
+            # 外层必须是 gzip 归档
+            local magic
+            magic="$(head -c 2 "$ipk" | od -An -tx1 | tr -d ' \n')"
+            if [ "$magic" != "1f8b" ]; then
+              echo "::error::${label} IPK 外层不是 gzip 归档: ${magic}"
+              exit 1
+            fi
+
+            # 外层成员必须齐全
+            local outer_list
+            outer_list="$(tar -tzf "$ipk")"
+            local member
+            for member in './debian-binary' './data.tar.gz' './control.tar.gz'; do
+              case "$outer_list" in
+                *"$member"*)
+                  ;;
+                *)
+                  echo "::error::${label} IPK 内缺少 ${member}"
+                  exit 1
+                  ;;
+              esac
+            done
+
+            # 解开后逐项比对
+            local VDIR="${TMPDIR}/verify-${label}"
+            rm -rf "$VDIR"
+            mkdir -p "$VDIR"
+            tar -xzf "$ipk" -C "$VDIR"
+            tar -xzf "${VDIR}/data.tar.gz" -C "$VDIR"
+            tar -xzf "${VDIR}/control.tar.gz" -C "$VDIR"
+
+            if [ ! -f "${VDIR}/usr/bin/${PKG_NAME}" ]; then
+              echo "::error::${label} IPK 内未找到 usr/bin/${PKG_NAME}"
+              exit 1
+            fi
+            if ! cmp -s "$bin_src" "${VDIR}/usr/bin/${PKG_NAME}"; then
+              echo "::error::${label} IPK 内二进制与源文件不一致"
+              exit 1
+            fi
+            if ! grep -qx "Version: ${want_ver}" "${VDIR}/control"; then
+              echo "::error::${label} IPK 内 control 的 Version 不正确"
+              grep '^Version:' "${VDIR}/control" || true
+              exit 1
+            fi
+
+            echo "${label} IPK 完整性校验通过（${size} 字节，二进制一致，control 版本 ${want_ver}）"
+          }
+
+          build_ipk "$ARCH_X86_64" "$X86_64_BIN" "$TARGET_IPK_X86_64"
+          build_ipk "$ARCH_AARCH64" "$AARCH64_BIN" "$TARGET_IPK_AARCH64"
 
           echo "校验生成的 IPK 完整性..."
-          for IPK in "$TARGET_IPK_AMD64" "$TARGET_IPK_AARCH64"; do
-            test -f "$IPK" || { echo "::error::IPK 文件缺失: ${IPK}"; exit 1; }
-            IPK_SIZE="$(stat -c%s "$IPK")"
-            if [ "$IPK_SIZE" -lt 100000 ]; then
-              echo "::error::IPK 文件异常过小 (${IPK_SIZE} 字节): ${IPK}"
-              exit 1
-            fi
-            # 外层为 tar.gz，校验 gzip 魔数 1f8b
-            GZ_MAGIC="$(head -c 2 "$IPK" | od -An -tx1 | tr -d ' \n')"
-            if [ "$GZ_MAGIC" != "1f8b" ]; then
-              echo "::error::IPK 不是合法的 gzip 归档 (magic=${GZ_MAGIC}): ${IPK}"
-              exit 1
-            fi
-            # 校验 tar.gz 内部文件列表，确保三个核心部件齐全
-            if ! tar -tzf "$IPK" | grep -q '^\./debian-binary$'; then
-              echo "::error::IPK 内缺少 debian-binary: ${IPK}"
-              exit 1
-            fi
-            if ! tar -tzf "$IPK" | grep -q '^\./control\.tar\.gz$'; then
-              echo "::error::IPK 内缺少 control.tar.gz: ${IPK}"
-              exit 1
-            fi
-            if ! tar -tzf "$IPK" | grep -q '^\./data\.tar\.gz$'; then
-              echo "::error::IPK 内缺少 data.tar.gz: ${IPK}"
-              exit 1
-            fi
-            echo "${IPK} 完整性校验通过 (大小: ${IPK_SIZE} 字节)"
-          done
+          verify_ipk "$TARGET_IPK_X86_64" "x86_64" "$X86_64_BIN" "${VER}-${PKG_RELEASE}"
+          verify_ipk "$TARGET_IPK_AARCH64" "aarch64" "$AARCH64_BIN" "${VER}-${PKG_RELEASE}"
 
-          echo "build_success=true" >> "$GITHUB_OUTPUT"
-          echo "new_version=${VER}" >> "$GITHUB_OUTPUT"
+          {
+            echo "build_success=true"
+            echo "new_version=${VER}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: 提交新版本到仓库
         if: steps.build.outputs.build_success == 'true'
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.build.outputs.new_version }}"
           BJ_TIME="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
 
           echo "正在提交 sing-box ${VER} 版本文件..."
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "${{ env.OUT_DIR_AMD64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_x86_64.ipk"
-          git add "${{ env.OUT_DIR_AARCH64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_aarch64.ipk"
+          # 用 -A 暂存目录，新增文件与旧版本删除都会被记录
+          git add -A "$OUT_DIR_X86_64" "$OUT_DIR_AARCH64"
 
           if git diff --cached --quiet; then
-            echo "无文件变更，跳过提交"
+            echo "没有文件变更，跳过提交"
           else
             git commit -m "🔄自动构建 sing-box ${VER} | ${BJ_TIME}(北京时间)"
             git push
@@ -329,14 +446,15 @@ jobs:
           fi
 
       - name: 构建结果总结
+        if: always()
         shell: bash
         run: |
           if [ "${{ steps.check_skip.outputs.should_skip }}" = "true" ]; then
-            echo "本次运行无新版本，未进行构建"
+            echo "本次运行未发现新版本，已跳过构建"
           elif [ "${{ steps.build.outputs.build_success }}" = "true" ]; then
-            echo "sing-box ${{ steps.build.outputs.new_version }} 版本 IPK 构建并推送成功！"
-            echo "  - x86_64: ${{ steps.check_skip.outputs.ipk_amd64 }}"
+            echo "sing-box ${{ steps.build.outputs.new_version }} 版本 IPK 构建成功"
+            echo "  - x86_64 : ${{ steps.check_skip.outputs.ipk_x86_64 }}"
             echo "  - aarch64: ${{ steps.check_skip.outputs.ipk_aarch64 }}"
           else
-            echo "构建步骤未执行（可能被跳过或失败）"
+            echo "构建步骤未执行或未成功，请查看上方日志"
           fi
