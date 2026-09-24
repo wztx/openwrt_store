@@ -215,6 +215,14 @@ jobs:
             local IPK_VER="${VER}-${{ env.PKG_RELEASE }}"
             local IPK_TMP="${TMPDIR}/ipk-${ARCH}"
 
+            # 关键修复：将输出路径转为绝对路径，防止子shell cd后相对路径漂移
+            case "$IPK_OUT" in
+              /*) ;;
+              *) IPK_OUT="${PWD}/${IPK_OUT}" ;;
+            esac
+            # 确保输出目录存在（在cd到临时目录之前创建）
+            mkdir -p "$(dirname "$IPK_OUT")"
+
             rm -rf "$IPK_TMP"
             mkdir -p "${IPK_TMP}/data/usr/bin"
             mkdir -p "${IPK_TMP}/control"
