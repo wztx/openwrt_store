@@ -99,8 +99,10 @@ jobs:
           FORCE_UPDATE: ${{ inputs.force_update }}
         run: |
           set -euo pipefail
-          geoip_ipk="v2ray-geoip_${UPSTREAM_VERSION}_all.ipk"
-          geosite_ipk="v2ray-geosite_${UPSTREAM_VERSION}_all.ipk"
+          # 文件名版本段与 control 的 Version 保持一致，均为「版本号-发布号」
+          file_version="${UPSTREAM_VERSION}-${RELEASE}"
+          geoip_ipk="v2ray-geoip_${file_version}_all.ipk"
+          geosite_ipk="v2ray-geosite_${file_version}_all.ipk"
           missing=0
           # 纯文件名对比：两个架构目录下的两个安装包全部存在即视为已同步
           for arch_dir in "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"; do
@@ -213,6 +215,7 @@ jobs:
             printf '2.0\n' > "${ipk_stage}/debian-binary"
 
             # 组装外层 tar.gz 容器，成员顺序与官方 ipkg-build 完全一致
+            # 文件名版本段使用「版本号-发布号」，与官方 ipkg-build 的命名规则一致
             ipk_file="${build_dir}/${pkg_name}_${package_version}_all.ipk"
             (
               cd "$ipk_stage" && tar --format=gnu --numeric-owner --sort=name \
@@ -238,7 +241,8 @@ jobs:
           for entry in "v2ray-geoip:geoip.dat" "v2ray-geosite:geosite.dat"; do
             pkg_name="${entry%%:*}"
             data_file="${entry##*:}"
-            ipk_file="${build_dir}/${pkg_name}_${package_version}_all.ipk"
+            # 文件名版本段使用「版本号-发布号」，与官方 ipkg-build 的命名规则一致
+            ipk_file="${build_dir}/${pkg_name}_${UPSTREAM_VERSION}-${RELEASE}_all.ipk"
 
             if [ ! -s "$ipk_file" ]; then
               echo "安装包不存在或为空: ${ipk_file}" >&2
@@ -333,8 +337,10 @@ jobs:
         run: |
           set -euo pipefail
           build_dir="$BUILD_ROOT/build"
-          geoip_ipk="v2ray-geoip_${package_version}_all.ipk"
-          geosite_ipk="v2ray-geosite_${package_version}_all.ipk"
+          # 文件名版本段与 control 的 Version 保持一致，均为「版本号-发布号」
+          file_version="${UPSTREAM_VERSION}-${RELEASE}"
+          geoip_ipk="v2ray-geoip_${file_version}_all.ipk"
+          geosite_ipk="v2ray-geosite_${file_version}_all.ipk"
 
           for arch_dir in "$ARCH_DIR_X86_64" "$ARCH_DIR_AARCH64"; do
             echo "处理目录: ${arch_dir}"
