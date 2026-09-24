@@ -1,394 +1,334 @@
 # ============================================================
-# 工作流名称：sing-box 版本同步
-# 功能说明：定时检查 SagerNet/sing-box 上游最新版本（含预发布版），
-#           下载 OpenWrt 24.10 对应架构的 ipk 包并同步到本仓库
-# 触发方式：每天 UTC 0:00（北京时间 08:00）定时触发 + 手动触发（支持强制更新）
-# 适用环境：OpenWrt 24.10，架构 x86_64 / aarch64_generic
+# sing-box OpenWrt IPK 自动构建与同步工作流（修正版）
+# 功能：每日定时检查上游最新版本，自动构建 x86_64 / aarch64 架构 IPK 包
+# 环境：OpenWrt 24.10
+# 外层格式：tar.gz（含 debian-binary / control.tar.gz / data.tar.gz）
 # ============================================================
 
-name: 自动更新 sing-box IPK 软件包
+name: sing-box IPK 自动构建同步
 
 on:
-  # 定时触发：每天 UTC 22:05（北京时间 06:05）
   schedule:
-    - cron: '5 22 * * *'
-
-  # 手动触发：支持强制更新参数
+    - cron: '5 22 * * *'	# 定时触发：每天 UTC 22:05（北京时间 06:05）
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制重新构建（忽略本地已存在的同名文件，默认否）'
+        description: '是否强制更新（忽略版本检查直接重新构建）'
         required: false
-        type: boolean
-        default: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
-# 并发限制：同一分支同一工作流只允许一个实例运行，排队等待
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: 'sing-box-ipk-build'
   cancel-in-progress: false
 
-# 授予工作流所需的最小权限
 permissions:
   contents: write
 
 jobs:
-  # ----------------------------------------------------------
-  # 任务：同步 sing-box 最新版本到仓库
-  # ----------------------------------------------------------
-  sync-sing-box:
-    name: 同步 sing-box 版本
+  build:
+    name: 检查并构建 IPK 安装包
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    env:
+      UPSTREAM_API: "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+      UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      PKG_NAME: "sing-box"
+      PKG_RELEASE: "1"
+      OUT_DIR_AMD64: "run/x86_64/sing-box"
+      OUT_DIR_AARCH64: "run/aarch64/sing-box"
 
     steps:
-      # --------------------------------------------------------
-      # 步骤 1：检出仓库代码
-      # --------------------------------------------------------
-      - name: 检出仓库代码
+      - name: 签出仓库代码
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # --------------------------------------------------------
-      # 步骤 2：配置 Git 用户信息
-      # --------------------------------------------------------
-      - name: 配置 Git 环境
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      # --------------------------------------------------------
-      # 步骤 3：获取上游最新版本信息（含预发布版）
-      # 说明：不使用 /latest 接口，直接获取 releases 列表第一个
-      #       即最新发布（包括 prerelease 预发布版）
-      # --------------------------------------------------------
-      - name: 获取上游最新版本信息
+      - name: 获取上游最新版本
         id: get_version
-        env:
-          UA_HEADER: "Mozilla/5.0 (compatible; sing-box-sync-bot/1.0)"
+        shell: bash
         run: |
-          echo "正在获取上游最新版本信息（含预发布版）..."
-
-          # 调用 GitHub API 获取 releases 列表（按发布时间倒序，第一个即为最新）
-          RELEASES_JSON=$(curl -sS -L \
+          set -euo pipefail
+          echo "正在请求上游版本信息..."
+          # 将 API 响应写入临时文件后用 grep 读取，彻底规避管道 SIGPIPE+pipefail 陷阱
+          RESP_FILE="$(mktemp)"
+          trap 'rm -f "$RESP_FILE"' EXIT
+          curl -sL --fail --retry 3 --retry-delay 2 \
             -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: ${UA_HEADER}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=1")
+            -H "User-Agent: ${{ env.UA }}" \
+            -o "$RESP_FILE" \
+            "${{ env.UPSTREAM_API }}"
 
-          # 检查 API 返回是否正常
-          if [ -z "${RELEASES_JSON}" ] || echo "${RELEASES_JSON}" | grep -q '"message"'; then
-            echo "::error::获取版本信息失败，API 返回异常"
-            echo "API 返回内容：${RELEASES_JSON}"
+          # grep 直接读文件，无管道生产者，不存在 SIGPIPE 问题
+          LATEST_TAG="$(grep -m1 -oP '"tag_name":\s*"\K[^"]+' "$RESP_FILE")"
+          LATEST_VER="${LATEST_TAG#v}"
+          echo "上游最新版本: ${LATEST_VER}"
+          if [ -z "$LATEST_VER" ]; then
+            echo "::error::获取版本号失败"
             exit 1
           fi
 
-          # 提取版本标签（如 v1.12.0-beta.1 或 v1.11.0）
-          TAG_NAME=$(echo "${RELEASES_JSON}" | jq -r '.[0].tag_name')
-          # 提取发布名称
-          RELEASE_NAME=$(echo "${RELEASES_JSON}" | jq -r '.[0].name')
-          # 是否为预发布版
-          IS_PRERELEASE=$(echo "${RELEASES_JSON}" | jq -r '.[0].prerelease')
-          # 发布时间
-          PUBLISHED_AT=$(echo "${RELEASES_JSON}" | jq -r '.[0].published_at')
+          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box-[^"]+-linux-amd64\.tar\.gz' "$RESP_FILE")"
+          AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_linux_aarch64\.pkg\.tar\.zst' "$RESP_FILE")"
 
-          if [ -z "${TAG_NAME}" ] || [ "${TAG_NAME}" = "null" ]; then
-            echo "::error::解析版本标签失败"
+          if [ -z "$AMD64_URL" ]; then
+            echo "::error::未找到 amd64 二进制包下载链接"
             exit 1
           fi
+          if [ -z "$AARCH64_URL" ]; then
+            echo "::error::未找到 aarch64 二进制包下载链接"
+            exit 1
+          fi
+          echo "amd64 链接: ${AMD64_URL}"
+          echo "aarch64 链接: ${AARCH64_URL}"
 
-          echo "最新版本标签：${TAG_NAME}"
-          echo "发布名称：${RELEASE_NAME}"
-          echo "是否预发布版：${IS_PRERELEASE}"
-          echo "发布时间：${PUBLISHED_AT}"
+          echo "latest_ver=${LATEST_VER}" >> "$GITHUB_OUTPUT"
+          echo "amd64_url=${AMD64_URL}" >> "$GITHUB_OUTPUT"
+          echo "aarch64_url=${AARCH64_URL}" >> "$GITHUB_OUTPUT"
 
-          # 构造两个架构对应的目标文件名（实际命名含 _openwrt_ 段）
-          VER_NO_V="${TAG_NAME#v}"
-          FILE_X86="sing-box_${VER_NO_V}_openwrt_x86_64.ipk"
-          FILE_AARCH64="sing-box_${VER_NO_V}_openwrt_aarch64_generic.ipk"
-
-          echo "x86_64 目标文件名：${FILE_X86}"
-          echo "aarch64_generic 目标文件名：${FILE_AARCH64}"
-
-          # 输出变量供后续步骤使用
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "ver_no_v=${VER_NO_V}" >> "$GITHUB_OUTPUT"
-          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
-          echo "file_x86=${FILE_X86}" >> "$GITHUB_OUTPUT"
-          echo "file_aarch64=${FILE_AARCH64}" >> "$GITHUB_OUTPUT"
-
-      # --------------------------------------------------------
-      # 步骤 4：检查本地是否已存在该版本文件（纯文件名对比）
-      # 说明：如果两个目标文件都已存在且非强制更新，则跳过
-      # --------------------------------------------------------
-      - name: 检查本地版本文件
-        id: check_local
+      - name: 版本对比检查
+        id: check_skip
+        shell: bash
         run: |
+          set -e
           FORCE="${{ github.event.inputs.force_update }}"
-          FILE_X86="${{ steps.get_version.outputs.file_x86 }}"
-          FILE_AARCH64="${{ steps.get_version.outputs.file_aarch64 }}"
-
-          # 目标目录路径（注意：aarch64_generic 对应 run/aarch64/sing-box）
-          DIR_X86="run/x86_64/sing-box"
-          DIR_AARCH64="run/aarch64/sing-box"
-
-          X86_EXISTS="false"
-          AARCH64_EXISTS="false"
-
-          if [ -f "${DIR_X86}/${FILE_X86}" ]; then
-            X86_EXISTS="true"
-            echo "x86_64 文件已存在：${DIR_X86}/${FILE_X86}"
+          VER="${{ steps.get_version.outputs.latest_ver }}"
+          IPK_AMD64="${{ env.OUT_DIR_AMD64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_x86_64.ipk"
+          IPK_AARCH64="${{ env.OUT_DIR_AARCH64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_aarch64.ipk"
+          echo "目标文件 x86_64: ${IPK_AMD64}"
+          echo "目标文件 aarch64: ${IPK_AARCH64}"
+          if [ "$FORCE" = "true" ]; then
+            echo "手动触发强制更新，跳过版本检查"
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+          elif [ -f "$IPK_AMD64" ] && [ -f "$IPK_AARCH64" ]; then
+            echo "两个架构的 ${VER} 版本 IPK 均已存在，跳过构建"
+            echo "should_skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "x86_64 文件不存在：${DIR_X86}/${FILE_X86}"
+            echo "发现新版本 ${VER}，开始构建"
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "ipk_amd64=${IPK_AMD64}" >> "$GITHUB_OUTPUT"
+          echo "ipk_aarch64=${IPK_AARCH64}" >> "$GITHUB_OUTPUT"
 
-          if [ -f "${DIR_AARCH64}/${FILE_AARCH64}" ]; then
-            AARCH64_EXISTS="true"
-            echo "aarch64 文件已存在：${DIR_AARCH64}/${FILE_AARCH64}"
-          else
-            echo "aarch64 文件不存在：${DIR_AARCH64}/${FILE_AARCH64}"
-          fi
-
-          # 判断是否需要更新
-          if [ "${FORCE}" = "true" ]; then
-            echo "检测到强制更新参数，将重新下载所有文件"
-            NEED_UPDATE="true"
-          elif [ "${X86_EXISTS}" = "true" ] && [ "${AARCH64_EXISTS}" = "true" ]; then
-            echo "两个架构的版本文件均已存在，无需更新"
-            NEED_UPDATE="false"
-          else
-            echo "有文件缺失，需要下载更新"
-            NEED_UPDATE="true"
-          fi
-
-          echo "x86_exists=${X86_EXISTS}" >> "$GITHUB_OUTPUT"
-          echo "aarch64_exists=${AARCH64_EXISTS}" >> "$GITHUB_OUTPUT"
-          echo "need_update=${NEED_UPDATE}" >> "$GITHUB_OUTPUT"
-          echo "dir_x86=${DIR_X86}" >> "$GITHUB_OUTPUT"
-          echo "dir_aarch64=${DIR_AARCH64}" >> "$GITHUB_OUTPUT"
-
-      # --------------------------------------------------------
-      # 步骤 5：创建临时下载目录
-      # --------------------------------------------------------
-      - name: 创建临时下载目录
-        if: steps.check_local.outputs.need_update == 'true'
-        run: |
-          mkdir -p /tmp/sing-box-download
-          echo "临时目录已创建：/tmp/sing-box-download"
-
-      # --------------------------------------------------------
-      # 步骤 6：下载新版本 ipk 文件
-      # --------------------------------------------------------
-      - name: 下载新版本 ipk 文件
-        if: steps.check_local.outputs.need_update == 'true'
+      - name: 下载并构建 IPK 包
+        if: steps.check_skip.outputs.should_skip == 'false'
+        id: build
+        shell: bash
         env:
-          UA_HEADER: "Mozilla/5.0 (compatible; sing-box-sync-bot/1.0)"
+          VER: ${{ steps.get_version.outputs.latest_ver }}
+          AMD64_URL: ${{ steps.get_version.outputs.amd64_url }}
+          AARCH64_URL: ${{ steps.get_version.outputs.aarch64_url }}
+          TARGET_IPK_AMD64: ${{ steps.check_skip.outputs.ipk_amd64 }}
+          TARGET_IPK_AARCH64: ${{ steps.check_skip.outputs.ipk_aarch64 }}
         run: |
-          TAG="${{ steps.get_version.outputs.tag_name }}"
-          FILE_X86="${{ steps.get_version.outputs.file_x86 }}"
-          FILE_AARCH64="${{ steps.get_version.outputs.file_aarch64 }}"
-          TMP_DIR="/tmp/sing-box-download"
+          set -euo pipefail
 
-          # 构造下载基础 URL
-          BASE_URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}"
+          TMPDIR="$(mktemp -d)"
+          CLEANED="false"
+          cleanup() {
+            if [ "$CLEANED" = "false" ]; then
+              CLEANED="true"
+              echo "正在清理临时目录: ${TMPDIR}"
+              rm -rf "$TMPDIR" || true
+              echo "临时文件清理完成"
+            fi
+          }
+          trap cleanup EXIT INT TERM
 
-          echo "开始下载文件，基础URL：${BASE_URL}"
+          AMD64_FILE="${TMPDIR}/sing-box-amd64.tar.gz"
+          AARCH64_FILE="${TMPDIR}/sing-box-aarch64.pkg.tar.zst"
+          WORK_AMD64="${TMPDIR}/build-amd64"
+          WORK_AARCH64="${TMPDIR}/build-aarch64"
+          mkdir -p "$WORK_AMD64" "$WORK_AARCH64"
 
-          # 下载 x86_64 版本
-          if [ "${{ steps.check_local.outputs.x86_exists }}" != "true" ] || [ "${{ github.event.inputs.force_update }}" = "true" ]; then
-            echo "正在下载 x86_64 版本：${FILE_X86}"
-            curl -fsSL -L \
-              -H "User-Agent: ${UA_HEADER}" \
-              -o "${TMP_DIR}/${FILE_X86}" \
-              "${BASE_URL}/${FILE_X86}"
-            if [ $? -ne 0 ] || [ ! -s "${TMP_DIR}/${FILE_X86}" ]; then
-              echo "::error::下载 x86_64 文件失败"
+          echo "正在下载 x86_64 二进制包..."
+          curl -sL --fail --retry 3 --retry-delay 2 \
+            -H "User-Agent: ${{ env.UA }}" \
+            -o "$AMD64_FILE" "$AMD64_URL"
+
+          echo "正在下载 aarch64 二进制包..."
+          curl -sL --fail --retry 3 --retry-delay 2 \
+            -H "User-Agent: ${{ env.UA }}" \
+            -o "$AARCH64_FILE" "$AARCH64_URL"
+
+          echo "正在解压 x86_64 包..."
+          tar -xzf "$AMD64_FILE" -C "$WORK_AMD64" --strip-components=1
+
+          echo "正在解压 aarch64 包..."
+          set +e
+          tar -xf "$AARCH64_FILE" -C "$WORK_AARCH64" --zstd usr/bin/sing-box 2>/dev/null
+          TAR_RC=$?
+          set -e
+          if [ "$TAR_RC" -ne 0 ] || [ ! -f "${WORK_AARCH64}/usr/bin/sing-box" ]; then
+            echo "tar --zstd 解压失败，尝试 zstd 管道方式..."
+            mkdir -p "${WORK_AARCH64}/usr/bin"
+            # 管道场景：tar 读完所有数据后退出，zstd 在写完数据后才退出，不会触发 SIGPIPE
+            zstd -d -c "$AARCH64_FILE" | tar -xf - -C "$WORK_AARCH64" usr/bin/sing-box
+          fi
+
+          AMD64_BIN="${WORK_AMD64}/sing-box"
+          AARCH64_BIN="${WORK_AARCH64}/usr/bin/sing-box"
+
+          # ELF 头校验：使用 od -An -tx1 替代 xxd -p（ubuntu-latest 默认无 xxd）
+          check_elf() {
+            local bin_file="$1"
+            local arch_name="$2"
+            test -f "$bin_file" || { echo "::error::${arch_name} sing-box 二进制文件不存在"; exit 1; }
+            # head 作为生产者写完 4 字节即正常退出，od 读完输入退出，无 SIGPIPE 风险
+            local magic
+            magic="$(head -c 4 "$bin_file" | od -An -tx1 | tr -d ' \n')"
+            local class
+            class="$(head -c 5 "$bin_file" | tail -c 1 | od -An -tx1 | tr -d ' \n')"
+            if [ "$magic" != "7f454c46" ]; then
+              echo "::error::${arch_name} 文件 ELF 魔数校验失败: ${magic}"
               exit 1
             fi
-            echo "x86_64 文件下载完成，大小：$(du -h "${TMP_DIR}/${FILE_X86}" | cut -f1)"
-          fi
-
-          # 下载 aarch64_generic 版本
-          if [ "${{ steps.check_local.outputs.aarch64_exists }}" != "true" ] || [ "${{ github.event.inputs.force_update }}" = "true" ]; then
-            echo "正在下载 aarch64_generic 版本：${FILE_AARCH64}"
-            curl -fsSL -L \
-              -H "User-Agent: ${UA_HEADER}" \
-              -o "${TMP_DIR}/${FILE_AARCH64}" \
-              "${BASE_URL}/${FILE_AARCH64}"
-            if [ $? -ne 0 ] || [ ! -s "${TMP_DIR}/${FILE_AARCH64}" ]; then
-              echo "::error::下载 aarch64_generic 文件失败"
+            if [ "$class" != "02" ]; then
+              echo "::error::${arch_name} 文件不是 64 位 ELF (class=${class})"
               exit 1
             fi
-            echo "aarch64_generic 文件下载完成，大小：$(du -h "${TMP_DIR}/${FILE_AARCH64}" | cut -f1)"
-          fi
+            echo "${arch_name} ELF 校验通过"
+          }
 
-          echo "所有文件下载完成"
-          ls -la "${TMP_DIR}/"
+          echo "校验 x86_64 ELF 头..."
+          check_elf "$AMD64_BIN" "x86_64"
+          echo "校验 aarch64 ELF 头..."
+          check_elf "$AARCH64_BIN" "aarch64"
 
-      # --------------------------------------------------------
-      # 步骤 7：确保目标目录存在
-      # --------------------------------------------------------
-      - name: 创建目标目录
-        if: steps.check_local.outputs.need_update == 'true'
+          mkdir -p "${{ env.OUT_DIR_AMD64 }}" "${{ env.OUT_DIR_AARCH64 }}"
+
+          echo "清理旧版本 sing-box IPK 文件..."
+          find "${{ env.OUT_DIR_AMD64 }}" -maxdepth 1 -type f -name "${{ env.PKG_NAME }}_*.ipk" -delete 2>/dev/null || true
+          find "${{ env.OUT_DIR_AARCH64 }}" -maxdepth 1 -type f -name "${{ env.PKG_NAME }}_*.ipk" -delete 2>/dev/null || true
+          echo "旧版本清理完成"
+
+          # ---------- IPK 构建函数（外层 tar.gz，内部结构对齐 ipkg-build 规范） ----------
+          build_ipk() {
+            local ARCH="$1"
+            local BIN_SRC="$2"
+            local IPK_OUT="$3"
+            local IPK_VER="${VER}-${{ env.PKG_RELEASE }}"
+            local IPK_TMP="${TMPDIR}/ipk-${ARCH}"
+
+            rm -rf "$IPK_TMP"
+            mkdir -p "${IPK_TMP}/data/usr/bin"
+            mkdir -p "${IPK_TMP}/control"
+
+            cp "$BIN_SRC" "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}"
+            chmod 0755 "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}"
+
+            printf '2.0\n' > "${IPK_TMP}/debian-binary"
+
+            # 生成 control 文件
+            local INST_SIZE
+            INST_SIZE="$(du -k "${IPK_TMP}/data/usr/bin/${{ env.PKG_NAME }}" | cut -f1)"
+            {
+              printf 'Package: %s\n' "${{ env.PKG_NAME }}"
+              printf 'Version: %s\n' "$IPK_VER"
+              printf 'Architecture: %s\n' "$ARCH"
+              printf 'Maintainer: OpenWrt Auto Build\n'
+              printf 'Installed-Size: %s\n' "$INST_SIZE"
+              printf 'Section: net\n'
+              printf 'Priority: optional\n'
+              printf 'Homepage: https://github.com/SagerNet/sing-box\n'
+              printf 'Description: The universal proxy platform\n'
+              printf ' sing-box is a universal proxy platform that supports multiple\n'
+              printf ' protocols. This package is built automatically via GitHub Actions.\n'
+            } > "${IPK_TMP}/control/control"
+
+            # 生成 postinst（使用 printf 避免 heredoc 缩进引发 YAML 解析陷阱）
+            printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || true\nexit 0\n' > "${IPK_TMP}/control/postinst"
+            chmod 0755 "${IPK_TMP}/control/postinst"
+
+            # 子 tar 打包：严格按 ( cd dir && tar -czf out.tar.gz . ) 方式，避免路径遗漏
+            echo "打包 ${ARCH} data.tar.gz..."
+            ( cd "${IPK_TMP}/data" && tar --format=gnu --owner=0 --group=0 -czf "${IPK_TMP}/data.tar.gz" . )
+
+            echo "打包 ${ARCH} control.tar.gz..."
+            ( cd "${IPK_TMP}/control" && tar --format=gnu --owner=0 --group=0 -czf "${IPK_TMP}/control.tar.gz" . )
+
+            # 外层打包改用 tar.gz（按要求），内部顺序对齐规范：debian-binary → control → data
+            echo "打包 ${ARCH} 最终 IPK (tar.gz 外层)..."
+            rm -f "$IPK_OUT"
+            ( cd "$IPK_TMP" && tar --owner=0 --group=0 -czf "$IPK_OUT" ./debian-binary ./control.tar.gz ./data.tar.gz )
+
+            echo "${ARCH} IPK 构建完成: ${IPK_OUT}"
+          }
+
+          build_ipk "x86_64" "$AMD64_BIN" "$TARGET_IPK_AMD64"
+          build_ipk "aarch64" "$AARCH64_BIN" "$TARGET_IPK_AARCH64"
+
+          echo "校验生成的 IPK 完整性..."
+          for IPK in "$TARGET_IPK_AMD64" "$TARGET_IPK_AARCH64"; do
+            test -f "$IPK" || { echo "::error::IPK 文件缺失: ${IPK}"; exit 1; }
+            IPK_SIZE="$(stat -c%s "$IPK")"
+            if [ "$IPK_SIZE" -lt 100000 ]; then
+              echo "::error::IPK 文件异常过小 (${IPK_SIZE} 字节): ${IPK}"
+              exit 1
+            fi
+            # 外层为 tar.gz，校验 gzip 魔数 1f8b
+            GZ_MAGIC="$(head -c 2 "$IPK" | od -An -tx1 | tr -d ' \n')"
+            if [ "$GZ_MAGIC" != "1f8b" ]; then
+              echo "::error::IPK 不是合法的 gzip 归档 (magic=${GZ_MAGIC}): ${IPK}"
+              exit 1
+            fi
+            # 校验 tar.gz 内部文件列表，确保三个核心部件齐全
+            if ! tar -tzf "$IPK" | grep -q '^\./debian-binary$'; then
+              echo "::error::IPK 内缺少 debian-binary: ${IPK}"
+              exit 1
+            fi
+            if ! tar -tzf "$IPK" | grep -q '^\./control\.tar\.gz$'; then
+              echo "::error::IPK 内缺少 control.tar.gz: ${IPK}"
+              exit 1
+            fi
+            if ! tar -tzf "$IPK" | grep -q '^\./data\.tar\.gz$'; then
+              echo "::error::IPK 内缺少 data.tar.gz: ${IPK}"
+              exit 1
+            fi
+            echo "${IPK} 完整性校验通过 (大小: ${IPK_SIZE} 字节)"
+          done
+
+          echo "build_success=true" >> "$GITHUB_OUTPUT"
+          echo "new_version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: 提交新版本到仓库
+        if: steps.build.outputs.build_success == 'true'
+        shell: bash
         run: |
-          DIR_X86="${{ steps.check_local.outputs.dir_x86 }}"
-          DIR_AARCH64="${{ steps.check_local.outputs.dir_aarch64 }}"
-          mkdir -p "${DIR_X86}" "${DIR_AARCH64}"
-          echo "目标目录已就绪：${DIR_X86}、${DIR_AARCH64}"
+          set -e
+          VER="${{ steps.build.outputs.new_version }}"
+          BJ_TIME="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
 
-      # --------------------------------------------------------
-      # 步骤 8：安全清理旧版本文件
-      # 说明：仅精确删除各目录下 sing-box_*_x86_64.ipk 和
-      #       sing-box_*_aarch64_generic.ipk 模式的文件，
-      #       不触碰其他任何文件，防止误删
-      # --------------------------------------------------------
-      - name: 清理旧版本文件
-        if: steps.check_local.outputs.need_update == 'true'
-        run: |
-          DIR_X86="${{ steps.check_local.outputs.dir_x86 }}"
-          DIR_AARCH64="${{ steps.check_local.outputs.dir_aarch64 }}"
+          echo "正在提交 sing-box ${VER} 版本文件..."
 
-          echo "开始清理旧版本文件..."
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 安全清理 x86_64 目录下的旧 sing-box ipk
-          # 使用精确 glob 匹配：sing-box_*_openwrt_x86_64.ipk
-          # 先列出将要删除的文件，确认后再删除
-          echo "x86_64 目录下待清理的文件："
-          X86_OLD_COUNT=0
-          if ls "${DIR_X86}"/sing-box_*_openwrt_x86_64.ipk 1>/dev/null 2>&1; then
-            for f in "${DIR_X86}"/sing-box_*_openwrt_x86_64.ipk; do
-              # 防御性检查：确保文件名确实匹配 sing-box 开头、.ipk 结尾
-              if [ -f "$f" ] && [[ "$(basename "$f")" =~ ^sing-box_.*_openwrt_x86_64\.ipk$ ]]; then
-                echo "  删除：$f"
-                rm -f "$f"
-                X86_OLD_COUNT=$((X86_OLD_COUNT + 1))
-              fi
-            done
-          else
-            echo "  （无旧文件）"
-          fi
-          echo "已清理 x86_64 旧文件数：${X86_OLD_COUNT}"
+          git add "${{ env.OUT_DIR_AMD64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_x86_64.ipk"
+          git add "${{ env.OUT_DIR_AARCH64 }}/${{ env.PKG_NAME }}_${VER}-${{ env.PKG_RELEASE }}_aarch64.ipk"
 
-          # 安全清理 aarch64 目录下的旧 sing-box ipk
-          echo "aarch64 目录下待清理的文件："
-          AARCH64_OLD_COUNT=0
-          if ls "${DIR_AARCH64}"/sing-box_*_openwrt_aarch64_generic.ipk 1>/dev/null 2>&1; then
-            for f in "${DIR_AARCH64}"/sing-box_*_openwrt_aarch64_generic.ipk; do
-              if [ -f "$f" ] && [[ "$(basename "$f")" =~ ^sing-box_.*_openwrt_aarch64_generic\.ipk$ ]]; then
-                echo "  删除：$f"
-                rm -f "$f"
-                AARCH64_OLD_COUNT=$((AARCH64_OLD_COUNT + 1))
-              fi
-            done
-          else
-            echo "  （无旧文件）"
-          fi
-          echo "已清理 aarch64 旧文件数：${AARCH64_OLD_COUNT}"
-
-          echo "旧版本文件清理完成"
-
-      # --------------------------------------------------------
-      # 步骤 9：将新文件移动到目标目录
-      # --------------------------------------------------------
-      - name: 部署新版本文件到仓库
-        if: steps.check_local.outputs.need_update == 'true'
-        run: |
-          TMP_DIR="/tmp/sing-box-download"
-          DIR_X86="${{ steps.check_local.outputs.dir_x86 }}"
-          DIR_AARCH64="${{ steps.check_local.outputs.dir_aarch64 }}"
-
-          echo "将新文件部署到仓库目录..."
-
-          if [ -f "${TMP_DIR}/${{ steps.get_version.outputs.file_x86 }}" ]; then
-            cp -f "${TMP_DIR}/${{ steps.get_version.outputs.file_x86 }}" "${DIR_X86}/"
-            echo "已部署 x86_64：${DIR_X86}/${{ steps.get_version.outputs.file_x86 }}"
-          fi
-
-          if [ -f "${TMP_DIR}/${{ steps.get_version.outputs.file_aarch64 }}" ]; then
-            cp -f "${TMP_DIR}/${{ steps.get_version.outputs.file_aarch64 }}" "${DIR_AARCH64}/"
-            echo "已部署 aarch64：${DIR_AARCH64}/${{ steps.get_version.outputs.file_aarch64 }}"
-          fi
-
-          echo "文件部署完成，验证目标目录："
-          ls -la "${DIR_X86}/"
-          echo "---"
-          ls -la "${DIR_AARCH64}/"
-
-      # --------------------------------------------------------
-      # 步骤 10：提交并推送到仓库
-      # --------------------------------------------------------
-      - name: 提交并推送新版本
-        if: steps.check_local.outputs.need_update == 'true'
-        id: commit
-        run: |
-          TAG="${{ steps.get_version.outputs.tag_name }}"
-          VER="${{ steps.get_version.outputs.ver_no_v }}"
-          IS_PRERELEASE="${{ steps.get_version.outputs.is_prerelease }}"
-
-          # 获取北京时间（UTC+8）
-          BEIJING_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
-
-          # 构造提交信息
-          if [ "${IS_PRERELEASE}" = "true" ]; then
-            COMMIT_MSG="🔄自动更新 sing-box ${VER} (预发布版) | ${BEIJING_TIME} (北京时间)"
-          else
-            COMMIT_MSG="🔄自动更新 sing-box ${VER} (正式版) | ${BEIJING_TIME} (北京时间)"
-          fi
-
-          echo "提交信息：${COMMIT_MSG}"
-
-          # 添加目标目录文件
-          DIR_X86="${{ steps.check_local.outputs.dir_x86 }}"
-          DIR_AARCH64="${{ steps.check_local.outputs.dir_aarch64 }}"
-          git add "${DIR_X86}/" "${DIR_AARCH64}/"
-
-          # 检查是否有变更
           if git diff --cached --quiet; then
-            echo "没有文件变更，跳过提交"
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "无文件变更，跳过提交"
           else
-            git commit -m "${COMMIT_MSG}"
+            git commit -m "🔄自动构建 sing-box ${VER} | ${BJ_TIME}(北京时间)"
             git push
             echo "提交并推送成功"
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # --------------------------------------------------------
-      # 步骤 11：输出同步结果摘要
-      # --------------------------------------------------------
-      - name: 输出同步结果
-        if: always()
+      - name: 构建结果总结
+        shell: bash
         run: |
-          TAG="${{ steps.get_version.outputs.tag_name }}"
-          NEED_UPDATE="${{ steps.check_local.outputs.need_update }}"
-          HAS_CHANGES="${{ steps.commit.outputs.has_changes }}"
-
-          echo "==================== 同步结果摘要 ===================="
-          echo "上游最新版本：${TAG:-未知}"
-          if [ "${NEED_UPDATE}" = "true" ]; then
-            if [ "${HAS_CHANGES}" = "true" ]; then
-              echo "同步状态：新版本已推送"
-            else
-              echo "同步状态：无文件变更（可能与现有版本一致）"
-            fi
+          if [ "${{ steps.check_skip.outputs.should_skip }}" = "true" ]; then
+            echo "本次运行无新版本，未进行构建"
+          elif [ "${{ steps.build.outputs.build_success }}" = "true" ]; then
+            echo "sing-box ${{ steps.build.outputs.new_version }} 版本 IPK 构建并推送成功！"
+            echo "  - x86_64: ${{ steps.check_skip.outputs.ipk_amd64 }}"
+            echo "  - aarch64: ${{ steps.check_skip.outputs.ipk_aarch64 }}"
           else
-            echo "同步状态：本地已是最新版本，无需更新"
-          fi
-          echo "======================================================"
-
-      # --------------------------------------------------------
-      # 步骤 12：清理临时文件（无论成功失败都执行）
-      # --------------------------------------------------------
-      - name: 清理临时文件
-        if: always()
-        run: |
-          TMP_DIR="/tmp/sing-box-download"
-          if [ -d "${TMP_DIR}" ]; then
-            rm -rf "${TMP_DIR}"
-            echo "临时文件目录已清理：${TMP_DIR}"
-          else
-            echo "临时目录不存在，无需清理"
+            echo "构建步骤未执行（可能被跳过或失败）"
           fi
