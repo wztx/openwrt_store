@@ -5,7 +5,7 @@
 # 外层格式：tar.gz（含 debian-binary / control.tar.gz / data.tar.gz）
 # ============================================================
 
-name: sing-box IPK 自动构建同步
+name: 自动构建 sing-box IPK 安装包
 
 on:
   schedule:
