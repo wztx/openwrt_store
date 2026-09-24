@@ -45,21 +45,40 @@ jobs:
 
       - name: "获取最新版本号（含预发布版）"
         run: |
-          RELEASE_JSON=$(curl -sL -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "https://api.github.com/repos/HyNetworks/hysteria/releases")
-          VERSION=$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"app\/v([^"]+)".*/\1/')
-          PRERELEASE=$(echo "${RELEASE_JSON}" | grep -m1 '"prerelease":' | sed -E 's/.*"prerelease": *(true|false).*/\1/')
+          VERSION_INFO=$(curl -sL \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            "https://api.github.com/repos/HyNetworks/hysteria/releases" | python3 -c '
+          import sys, json, re
+          data = json.load(sys.stdin)
+          if not isinstance(data, list) or len(data) == 0:
+              sys.exit("API返回空列表")
+          latest = data[0]
+          tag = latest.get("tag_name", "")
+          prerelease = bool(latest.get("prerelease", False))
+          # 支持多种tag格式: app/vX.Y.Z, vX.Y.Z, X.Y.Z, vX.Y.Z-beta.1 等
+          m = re.search(r"(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?)", tag)
+          if not m:
+              sys.exit("无法从tag %s 中提取版本号" % tag)
+          version = m.group(1)
+          vtype = "pre" if prerelease else "stable"
+          print("%s|%s|%s" % (version, vtype, tag))
+          ') || exit 1
+          VERSION=$(echo "${VERSION_INFO}" | cut -d'|' -f1)
+          VERSION_TYPE_FLAG=$(echo "${VERSION_INFO}" | cut -d'|' -f2)
+          ORIG_TAG=$(echo "${VERSION_INFO}" | cut -d'|' -f3)
           if [ -z "${VERSION}" ]; then
-            echo "错误：无法获取版本号"
+            echo "错误：提取版本号为空"
             exit 1
           fi
-          if [ "${PRERELEASE}" = "true" ]; then
+          if [ "${VERSION_TYPE_FLAG}" = "pre" ]; then
             VERSION_TYPE="预发布版"
           else
             VERSION_TYPE="正式版"
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "VERSION_TYPE=${VERSION_TYPE}" >> "$GITHUB_ENV"
-          echo "上游最新版本: ${VERSION} (${VERSION_TYPE})"
+          echo "ORIG_TAG=${ORIG_TAG}" >> "$GITHUB_ENV"
+          echo "上游最新版本: ${VERSION} (${VERSION_TYPE}), tag: ${ORIG_TAG}"
 
       - name: "检查文件是否已存在"
         id: check_exist
@@ -87,10 +106,12 @@ jobs:
         if: env.SKIP_BUILD != 'true'
         run: |
           mkdir -p "${BUILD_DIR}/bin"
+          # URL编码原始tag中的/符号
+          TAG_ENCODED=$(echo "${ORIG_TAG}" | sed 's/\//%2F/g')
           echo "下载 amd64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2Fv${VERSION}/hysteria-linux-amd64" -o "${BUILD_DIR}/bin/hysteria-amd64" || exit 1
+          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/${TAG_ENCODED}/hysteria-linux-amd64" -o "${BUILD_DIR}/bin/hysteria-amd64" || exit 1
           echo "下载 arm64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/app%2Fv${VERSION}/hysteria-linux-arm64" -o "${BUILD_DIR}/bin/hysteria-arm64" || exit 1
+          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/${TAG_ENCODED}/hysteria-linux-arm64" -o "${BUILD_DIR}/bin/hysteria-arm64" || exit 1
           echo "下载完成"
           ls -lh "${BUILD_DIR}/bin/"
 
@@ -128,7 +149,7 @@ jobs:
           # 校验
           IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
           echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1024 ]; then
+          if [ "${IPK_SIZE}" -lt 1048576 ]; then
             echo "错误：IPK文件过小（小于1MB），构建可能失败"
             exit 1
           fi
@@ -181,7 +202,7 @@ jobs:
           # 校验
           IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
           echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1024 ]; then
+          if [ "${IPK_SIZE}" -lt 1048576 ]; then
             echo "错误：IPK文件过小（小于1MB），构建可能失败"
             exit 1
           fi
