@@ -73,7 +73,7 @@ jobs:
             exit 1
           fi
 
-          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box-[^"]+-openwrt_x86_64\.ipk' "$RESP_FILE")"
+          AMD64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_openwrt_x86_64\.ipk' "$RESP_FILE")"
           AARCH64_URL="$(grep -m1 -oP '"browser_download_url":\s*"\K[^"]+sing-box_[^"]+_openwrt_aarch64_generic\.ipk' "$RESP_FILE")"
 
           if [ -z "$AMD64_URL" ]; then
