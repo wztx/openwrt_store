@@ -140,8 +140,8 @@ jobs:
           }
           trap cleanup EXIT INT TERM
 
-          AMD64_FILE="${TMPDIR}/sing-box-amd64.tar.gz"
-          AARCH64_FILE="${TMPDIR}/sing-box-aarch64.pkg.tar.zst"
+          AMD64_FILE="${TMPDIR}/sing-box_1.14.2_openwrt_x86_64.ipk"
+          AARCH64_FILE="${TMPDIR}/sing-box_1.14.2_openwrt_aarch64_generic.ipk"
           WORK_AMD64="${TMPDIR}/build-amd64"
           WORK_AARCH64="${TMPDIR}/build-aarch64"
           mkdir -p "$WORK_AMD64" "$WORK_AARCH64"
