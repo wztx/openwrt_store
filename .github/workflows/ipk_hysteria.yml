@@ -138,8 +138,9 @@ jobs:
           echo "ELF头校验通过"
           # 写control文件
           printf 'Package: hysteria\nVersion: %s-%s\nSection: net\nPriority: optional\nArchitecture: %s\nDepends: libc\nInstalled-Size: %s\nMaintainer: Auto Build <auto-build@github.com>\nDescription: Hysteria is a feature-packed proxy & relay tool optimized for harsh networks.\n' "${VERSION}" "${RELEASE}" "${ARCH_PKG}" "$(du -sk "${IPK_DIR}/data" | cut -f1)" > "${IPK_DIR}/control/control"
-          # 写postinst
-          printf '#!/bin/sh\nchmod +x /usr/bin/hysteria\n' > "${IPK_DIR}/control/postinst"
+          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
+          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] && exit 0\nchmod 0755 /usr/bin/hysteria\nexit 0\n' > "${IPK_DIR}/control/postinst"
           chmod 755 "${IPK_DIR}/control/postinst"
           # 打包
           printf '2.0\n' > "${IPK_DIR}/debian-binary"
@@ -162,7 +163,9 @@ jobs:
             echo "错误：IPK内部路径验证失败，未找到usr/bin/hysteria"
             exit 1
           fi
-          echo "IPK结构与完整性校验通过"
+          # 模拟ImageBuilder构建环境执行postinst（设置IPKG_INSTROOT），验证脚本返回0
+          ( mkdir -p "${IPK_DIR}/verify/fake_root" && IPKG_INSTROOT="${IPK_DIR}/verify/fake_root/" sh "${IPK_DIR}/control/postinst" ) || { echo "错误：postinst在构建环境执行失败（exit $?）"; exit 1; }
+          echo "IPK格式、结构、postinst脚本校验全部通过"
           REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
           mkdir -p "${REPO_DIR}"
           cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
@@ -191,8 +194,9 @@ jobs:
           echo "ELF头校验通过"
           # 写control文件
           printf 'Package: hysteria\nVersion: %s-%s\nSection: net\nPriority: optional\nArchitecture: %s\nDepends: libc\nInstalled-Size: %s\nMaintainer: Auto Build <auto-build@github.com>\nDescription: Hysteria is a feature-packed proxy & relay tool optimized for harsh networks.\n' "${VERSION}" "${RELEASE}" "${ARCH_PKG}" "$(du -sk "${IPK_DIR}/data" | cut -f1)" > "${IPK_DIR}/control/control"
-          # 写postinst
-          printf '#!/bin/sh\nchmod +x /usr/bin/hysteria\n' > "${IPK_DIR}/control/postinst"
+          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
+          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
+          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] && exit 0\nchmod 0755 /usr/bin/hysteria\nexit 0\n' > "${IPK_DIR}/control/postinst"
           chmod 755 "${IPK_DIR}/control/postinst"
           # 打包
           printf '2.0\n' > "${IPK_DIR}/debian-binary"
@@ -215,7 +219,9 @@ jobs:
             echo "错误：IPK内部路径验证失败，未找到usr/bin/hysteria"
             exit 1
           fi
-          echo "IPK结构与完整性校验通过"
+          # 模拟ImageBuilder构建环境执行postinst（设置IPKG_INSTROOT），验证脚本返回0
+          ( mkdir -p "${IPK_DIR}/verify/fake_root" && IPKG_INSTROOT="${IPK_DIR}/verify/fake_root/" sh "${IPK_DIR}/control/postinst" ) || { echo "错误：postinst在构建环境执行失败（exit $?）"; exit 1; }
+          echo "IPK格式、结构、postinst脚本校验全部通过"
           REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
           mkdir -p "${REPO_DIR}"
           cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
