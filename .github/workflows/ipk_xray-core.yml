@@ -369,7 +369,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "⏭️  无文件变更，跳过提交。"
           else
-            commit_msg="自动更新：Xray-core ${ver}（北京时间 ${bj_time}）"
+            commit_msg="🔄自动构建：Xray-core ${ver} | ${bj_time}(北京时间)"
             git commit -m "$commit_msg"
             git push
             echo "✅ 已推送：${commit_msg}"
