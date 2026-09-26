@@ -40,10 +40,10 @@ jobs:
       UA_HEAD: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
       TMP_DIR: '/tmp/rtp2httpd-sync'
       # 架构映射：目标架构名 => 仓库子目录（按用户要求）
-      # x86_64 → run/x86_64/luci-app-openlist2
-      # aarch64_generic → run/aarch64/luci-app-openlist2
-      ARCH_x86_64_DIR: 'run/x86_64/luci-app-openlist2'
-      ARCH_aarch64_generic_DIR: 'run/aarch64/luci-app-openlist2'
+      # x86_64 → run/x86_64/luci-app-rtp2httpd
+      # aarch64_generic → run/aarch64/luci-app-rtp2httpd
+      ARCH_x86_64_DIR: 'run/x86_64/luci-app-rtp2httpd'
+      ARCH_aarch64_generic_DIR: 'run/aarch64/luci-app-rtp2httpd'
 
     steps:
       # ==================== 步骤1：检出代码 ====================
