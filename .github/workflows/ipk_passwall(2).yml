@@ -1,10 +1,11 @@
 # 工作流：自动更新 Passwall(2) IPK 软件包
 # 说明：
-#   1. 从 SourceForge 的 openwrt-passwall-build 项目 RSS 源获取最新的 IPK 软件包信息；
-#   2. 使用 wget -qO 严格下载 RSS 与 IPK（不得添加任何多余参数，否则会触发反爬）；
-#   3. _all 通用包只下载一次，通过全局缓存复制到 x86_64 与 aarch64 两个架构目录；
-#   4. 下载 IPK 时，先尝试去掉 /download 后缀的 URL；若失败，则回退到带 /download 后缀的原始 URL 再次尝试；
-#   5. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
+#   1. 从 SourceForge 的 openwrt-passwall-build 项目 RSS 源获取 IPK 软件包信息（架构相关包）；
+#   2. 从 GitHub Releases API 获取 Passwall / Passwall2 的 _all 通用包（含预发布版）；
+#   3. 使用 wget -qO 严格下载 RSS 与 IPK（不得添加任何多余参数，否则会触发反爬）；
+#   4. _all 通用包只下载一次，通过全局缓存复制到 x86_64 与 aarch64 两个架构目录；
+#   5. 下载 IPK 时，先尝试原始 URL；若失败，则回退到带 /download 后缀的 URL 再次尝试；
+#   6. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
 #      - x86_64 架构提交至 run/x86_64/luci-app-passwall/
 #      - aarch64_generic 架构提交至 run/aarch64/luci-app-passwall/
 name: 自动更新 Passwall(2) IPK 软件包
@@ -41,6 +42,26 @@ env:
   RSS_X86_64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_packages/"
   RSS_X86_64_PASSWALL2: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall2"
   RSS_AARCH64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/aarch64_generic/passwall_packages/"
+  # GitHub Releases 配置：_all 通用包从 GitHub API 获取（含预发布版）
+  GITHUB_RELEASES: |
+    {
+      "repos": [
+        {
+          "repo": "Openwrt-Passwall/openwrt-passwall",
+          "file_patterns": [
+            "23.05-24.10_luci-app-passwall_*_all.ipk",
+            "23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk"
+          ]
+        },
+        {
+          "repo": "Openwrt-Passwall/openwrt-passwall2",
+          "file_patterns": [
+            "luci-app-passwall2_*_all.ipk",
+            "luci-i18n-passwall2-zh-cn_*_all.ipk"
+          ]
+        }
+      ]
+    }
   # 架构矩阵（JSON）：定义每个架构需要从哪些 RSS 源、匹配哪些文件名通配符，
   # 以及提交时的目标目录名（target_dir）。
   # 注意：aarch64_generic 架构的 target_dir 为 "aarch64"，即提交到 run/aarch64/ 下。
@@ -124,20 +145,22 @@ jobs:
           echo "==> 读取触发参数 完成"
 
       # =====================================================================
-      # 步骤 3：解析 RSS 并下载 IPK 文件
+      # 步骤 3：解析 RSS 与 GitHub Releases 并下载 IPK 文件
       #   - 全局收集唯一 RSS 源并去重
       #   - 一次性下载并解析所有 RSS，构建全局 URL 列表
-      #     每个条目保存两个 URL：去掉 /download 后缀的 URL 和原始带 /download 的 URL
+      #   - 调用 GitHub Releases API（含预发布版），构建 _all 通用包的 URL 列表
       #   - 按架构匹配文件通配符并下载
-      #   - 下载时优先使用去掉 /download 后缀的 URL；若失败，回退到带 /download 的原始 URL
+      #   - 下载时优先使用原始 URL；若失败，回退到带 /download 后缀的 URL
       #   - _all 通用包只下载一次，通过 downloaded_cache 复制到多个架构目录
       #   - 目标目录使用 ARCH_MATRIX 中的 target_dir 字段：
       #       x86_64          -> run/x86_64/luci-app-passwall/
       #       aarch64_generic -> run/aarch64/luci-app-passwall/
       # =====================================================================
-      - name: 解析 RSS 并下载 IPK 文件
+      - name: 解析 RSS 与 GitHub Releases 并下载 IPK 文件
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "==> 解析 RSS 并下载 IPK 文件 开始"
+          echo "==> 解析 RSS 与 GitHub Releases 并下载 IPK 文件 开始"
           python3 - <<'PYEOF'
           import xml.etree.ElementTree as ET
           import subprocess
@@ -146,6 +169,8 @@ jobs:
           import fnmatch
           import json
           import shutil
+          import urllib.request
+          import urllib.error
 
 
           def fmt_size(n: int) -> str:
@@ -157,8 +182,23 @@ jobs:
               return f"{n} B"
 
 
+          def github_api_get(url: str) -> dict:
+              """调用 GitHub API（使用 GITHUB_TOKEN 认证以避免速率限制）"""
+              req = urllib.request.Request(url)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("Authorization", f"Bearer {os.environ.get('GITHUB_TOKEN', '')}")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.load(resp)
+              except urllib.error.HTTPError as e:
+                  print(f"错误：GitHub API 请求失败 ({url}): {e}", file=sys.stderr)
+                  sys.exit(1)
+
+
           # ---------- 读取环境变量 ----------
           arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
+          github_releases = json.loads(os.environ["GITHUB_RELEASES"])
           dest_dir = os.environ["DEST_DIR"]              # run
           pkg_dir_name = os.environ["PKG_DIR_NAME"]      # luci-app-passwall
           force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
@@ -177,7 +217,6 @@ jobs:
           # ---------- 2. 下载并解析所有 RSS，汇总全局 URL ----------
           # 注意：RSS 下载必须严格使用 wget -qO，不得添加多余参数，
           #       否则会触发 SourceForge/Cloudflare 反爬机制导致下载失败。
-          # 每个条目存储为字典：{"no_download": 去掉后缀的URL, "with_download": 原始URL}
           all_urls = []
           for rss_var in sorted(all_rss_vars):
               rss_url = os.environ[rss_var]
@@ -188,7 +227,6 @@ jobs:
                   print(f"错误：RSS 下载失败 ({rss_var})", file=sys.stderr)
                   sys.exit(1)
 
-              # 使用 Python 标准库解析 RSS
               try:
                   tree = ET.parse(rss_file)
               except Exception as e:
@@ -209,9 +247,55 @@ jobs:
                       count += 1
               print(f"==> {rss_var} 解析出 {count} 个文件 URL")
 
-          print(f"==> 全局 RSS 解析完成，共获取 {len(all_urls)} 个文件 URL")
+          print(f"==> RSS 解析完成，共获取 {len(all_urls)} 个文件 URL")
 
-          # ---------- 3. 按架构匹配并下载/复制 ----------
+          # ---------- 3. 调用 GitHub Releases API（含预发布版），构建 _all 包 URL ----------
+          # 说明：/releases/latest 只返回最新的正式版，不包含预发布版。
+          #       为获取含预发布版的最新版，改为获取 releases 列表，取第一个非草稿项。
+          for repo_cfg in github_releases["repos"]:
+              repo = repo_cfg["repo"]
+              patterns = repo_cfg["file_patterns"]
+              api_url = f"https://api.github.com/repos/{repo}/releases?per_page=10"
+              print(f"==> 调用 GitHub API: {api_url}")
+              releases = github_api_get(api_url)
+
+              # 筛选出非草稿的 release（含预发布版），按创建时间降序排列
+              candidates = [
+                  r for r in releases
+                  if not r.get("draft", False)
+              ]
+              if not candidates:
+                  print(f"错误：未找到可用的 Release ({repo})", file=sys.stderr)
+                  sys.exit(1)
+
+              # 取最新的一个（含预发布版）
+              latest = candidates[0]
+              tag = latest.get("tag_name", "unknown")
+              is_prerelease = latest.get("prerelease", False)
+              print(f"==> {repo} 最新 Release: tag={tag}, 预发布={is_prerelease}")
+
+              # 从 assets 中匹配需要的文件
+              for asset in latest.get("assets", []):
+                  filename = asset.get("name", "")
+                  for pattern in patterns:
+                      if fnmatch.fnmatch(filename, pattern):
+                          download_url = asset.get("browser_download_url", "")
+                          if not download_url:
+                              continue
+                          # GitHub Releases 的 URL 通常不需要 /download 后缀，
+                          # 但为保持与 RSS 下载逻辑统一，仍构建回退 URL
+                          no_download_url = download_url.replace("/download", "")
+                          with_download_url = download_url
+                          all_urls.append({
+                              "no_download": no_download_url,
+                              "with_download": with_download_url
+                          })
+                          print(f"==>   [GitHub] 匹配: {filename}")
+                          break
+
+          print(f"==> 全局 URL 汇总完成，共 {len(all_urls)} 个文件 URL")
+
+          # ---------- 4. 按架构匹配并下载/复制 ----------
           downloaded_cache = {}   # 文件名 -> 临时文件完整路径（用于 _all 通用包复用）
           summary_lines = []      # Markdown 表格行，用于 STEP_SUMMARY
 
@@ -248,13 +332,12 @@ jobs:
                           shutil.copy2(src_path, dest_path)
                       else:
                           tmp_file = os.path.join(tmp_root, filename)
-                          # 第一次尝试：去掉 /download 后缀的 URL
-                          print(f"==> 尝试下载 (无 /download 后缀): {entry['no_download']}")
+                          # 第一次尝试：原始 URL（去掉 /download 后缀）
+                          print(f"==> 尝试下载: {entry['no_download']}")
                           r = subprocess.run(["wget", "-qO", tmp_file, entry["no_download"]])
                           if r.returncode != 0:
                               # 回退：加回 /download 后缀的原始 URL
-                              print(f"==> 首次下载失败，回退尝试 (带 /download 后缀): {entry['with_download']}")
-                              # 清除可能残留的临时文件
+                              print(f"==> 首次下载失败，回退尝试: {entry['with_download']}")
                               if os.path.exists(tmp_file):
                                   os.remove(tmp_file)
                               r = subprocess.run(["wget", "-qO", tmp_file, entry["with_download"]])
@@ -278,7 +361,7 @@ jobs:
               f.write("\n".join(summary_lines) + "\n")
           print(f"==> 本次共处理 {len(summary_lines)} 个文件")
           PYEOF
-          echo "==> 解析 RSS 并下载 IPK 文件 完成"
+          echo "==> 解析 RSS 与 GitHub Releases 并下载 IPK 文件 完成"
 
       # =====================================================================
       # 步骤 4：文件完整性校验
@@ -398,7 +481,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 由模板 + 运行时的 BUILD_TIME 组合成最终提交信息
           COMMIT_MSG=$(printf '%s' "$COMMIT_MSG_TEMPLATE" | sed "s/\${BUILD_TIME}/${BUILD_TIME}/g")
           echo "提交信息: $COMMIT_MSG"
 
