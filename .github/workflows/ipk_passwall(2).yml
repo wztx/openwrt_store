@@ -11,18 +11,15 @@
 #      下载前会预先检查：若所有架构目标目录中均已存在同名文件（且非强制更新），
 #      则直接跳过下载，避免无谓的带宽消耗；
 #   6. 下载 IPK 时，先尝试去掉 /download 后缀的 URL；若失败，则回退到带 /download 后缀的原始 URL 再次尝试；
-#   7. 复制文件时使用 shutil.copy（不保留源 mtime），确保目标文件 mtime 为当前时间，
-#      避免清理步骤因 Last-Modified 头导致的 mtime 排序误删新文件；
-#   8. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
-#      - x86_64 架构提交至 run/x86_64/luci-app-passwall/
-#      - aarch64_generic 架构提交至 run/aarch64/luci-app-passwall/
+#   7. 复制文件时使用 shutil.copy（不保留源 mtime），确保目标文件 mtime 为当前时间；
+#   8. 清理 _all 包时，legacy_matches 排除已匹配 final_pattern 的文件，
+#      避免当 github_pattern == final_pattern 时同一文件被误删；
+#   9. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
 name: 自动更新 Passwall(2) IPK 软件包
 
 on:
-  # 定时触发：每天 UTC 22:03（北京时间次日 06:03）
   schedule:
     - cron: '3 22 * * *'
-  # 手动触发：提供 force_update 布尔开关，默认 false
   workflow_dispatch:
     inputs:
       force_update:
@@ -31,31 +28,23 @@ on:
         type: boolean
         default: false
 
-# 并发控制：同一工作流+分支串行，不取消正在进行的运行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-# 需要写权限以提交产物
 permissions:
   contents: write
 
-# 全局固定配置（不随每次运行变化）
 env:
   TZ: Asia/Shanghai
   COMMIT_MSG_TEMPLATE: "🔄自动更新 Passwall(2) IPK 软件包 | ${BUILD_TIME}(北京时间)"
   DEST_DIR: run
   PKG_DIR_NAME: luci-app-passwall
-  # GitHub 来源文件名前缀（下载后会被去掉，以统一最终产物命名）
   GITHUB_FILENAME_PREFIX: "23.05-24.10_"
   RSS_X86_64_LUCI: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_luci/"
   RSS_X86_64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_packages/"
   RSS_X86_64_PASSWALL2: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall2"
   RSS_AARCH64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/aarch64_generic/passwall_packages/"
-  # _all 通用包配置：定义每个包的 GitHub 优先源与 SourceForge 回退源
-  #   - github_repo / github_pattern：GitHub Releases 上的仓库与文件名通配符
-  #   - fallback_rss_var / fallback_pattern：回退到 SourceForge RSS 的源变量与文件名通配符
-  #   - final_pattern：最终保存到仓库中的文件名通配符（去前缀后）
   ALL_PACKAGES: |
     [
       {
@@ -91,11 +80,6 @@ env:
         "final_pattern": "luci-i18n-passwall2-zh-cn_*_all.ipk"
       }
     ]
-  # 架构矩阵（JSON）：定义每个架构需要从哪些 RSS 源、匹配哪些文件名通配符，
-  # 以及提交时的目标目录名（target_dir）。
-  # 注意：
-  #   - aarch64_generic 架构的 target_dir 为 "aarch64"，即提交到 run/aarch64/ 下；
-  #   - file_patterns 仅包含架构相关包（_all 通用包在 ALL_PACKAGES 中单独处理）。
   ARCH_MATRIX: |
     [
       {
@@ -165,8 +149,6 @@ jobs:
 
       # =====================================================================
       # 步骤 3：解析 RSS 与 GitHub Releases 并下载 IPK 文件
-      #   关键点：复制文件统一使用 shutil.copy（不保留源 mtime），
-      #           确保清理步骤能正确识别新文件。
       # =====================================================================
       - name: 解析 RSS 与 GitHub Releases 并下载 IPK 文件
         env:
@@ -186,7 +168,6 @@ jobs:
 
 
           def fmt_size(n: int) -> str:
-              """将字节数格式化为易读的字符串"""
               if n >= 1024 * 1024:
                   return f"{n / (1024 * 1024):.2f} MiB"
               if n >= 1024:
@@ -195,7 +176,6 @@ jobs:
 
 
           def github_api_get(url: str) -> list:
-              """调用 GitHub API（使用 GITHUB_TOKEN 认证以避免速率限制）"""
               req = urllib.request.Request(url)
               req.add_header("Accept", "application/vnd.github+json")
               token = os.environ.get("GITHUB_TOKEN", "")
@@ -214,7 +194,6 @@ jobs:
 
 
           def wget_try(url_no_dl: str, url_with_dl: str, out_file: str) -> bool:
-              """先尝试无 /download 后缀，失败则回退到带 /download 后缀"""
               print(f"==> 尝试下载: {url_no_dl}")
               r = subprocess.run(["wget", "-qO", out_file, url_no_dl])
               if r.returncode == 0 and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
@@ -232,7 +211,6 @@ jobs:
 
 
           def strip_gh_prefix(filename: str, prefix: str) -> str:
-              """去掉 GitHub 来源的文件名前缀（如 "23.05-24.10_"）"""
               if prefix and filename.startswith(prefix):
                   return filename[len(prefix):]
               return filename
@@ -242,20 +220,18 @@ jobs:
               """
               复制文件内容到目标路径，但不保留源 mtime。
               使用 shutil.copy（仅复制内容+权限位，不复制 mtime），
-              确保目标文件 mtime 为当前时间，避免清理步骤的 mtime 排序
-              因 HTTP Last-Modified 头导致新文件被误判为旧文件。
+              再显式刷新 mtime 为当前时间。
               """
               shutil.copy(src, dst)
-              # 额外保险：显式刷新 mtime 为当前时间
               os.utime(dst, None)
 
 
           # ---------- 读取环境变量 ----------
           arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
           all_packages = json.loads(os.environ["ALL_PACKAGES"])
-          dest_dir = os.environ["DEST_DIR"]              # run
-          pkg_dir_name = os.environ["PKG_DIR_NAME"]      # luci-app-passwall
-          gh_prefix = os.environ.get("GITHUB_FILENAME_PREFIX", "")  # 23.05-24.10_
+          dest_dir = os.environ["DEST_DIR"]
+          pkg_dir_name = os.environ["PKG_DIR_NAME"]
+          gh_prefix = os.environ.get("GITHUB_FILENAME_PREFIX", "")
           force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
           tmp_root = "/tmp/passwall-build"
           os.makedirs(tmp_root, exist_ok=True)
@@ -263,7 +239,7 @@ jobs:
           print(f"==> GitHub 文件名前缀（将去除）: '{gh_prefix}'")
           print(f"==> 临时目录: {tmp_root}")
 
-          # ---------- 1. 全局收集唯一 RSS 变量（去重）----------
+          # ---------- 1. 全局收集唯一 RSS 变量 ----------
           all_rss_vars = set()
           for arch_info in arch_matrix:
               for rss_var in arch_info["rss_feeds"]:
@@ -309,7 +285,7 @@ jobs:
 
           print(f"==> RSS 解析完成，共获取 {len(rss_urls)} 个文件 URL")
 
-          # ---------- 3. 调用 GitHub Releases API（含预发布版）----------
+          # ---------- 3. 调用 GitHub Releases API ----------
           github_assets = {}
           repos_processed = set()
           for pkg_cfg in all_packages:
@@ -366,7 +342,6 @@ jobs:
                   print(f"==> 警告: {pkg_name} 在 GitHub 与 SourceForge 均无匹配，跳过")
                   continue
 
-              # 计算最佳候选的最终文件名（去掉 GitHub 前缀）
               best = candidates[0]
               best_final = strip_gh_prefix(best["filename"], gh_prefix)
 
@@ -449,7 +424,6 @@ jobs:
                       if not wget_try(url_info["no_download"], url_info["with_download"], tmp_file):
                           print(f"错误：下载失败 {filename}", file=sys.stderr)
                           sys.exit(1)
-                      # 使用 copy_fresh：目标文件获得当前 mtime，便于清理排序
                       copy_fresh(tmp_file, dest_path)
                       print(f"==> 保存至: {dest_path}")
 
@@ -460,7 +434,7 @@ jobs:
                   if not matched:
                       print(f"==> 警告: 未找到匹配文件: {pattern}")
 
-              # (b) _all 通用包：从 all_pkg_downloads 复制到当前架构目录
+              # (b) _all 通用包
               for pkg_name, pkg_info in all_pkg_downloads.items():
                   filename = pkg_info["filename"]
                   tmp_path = pkg_info.get("tmp_path")
@@ -477,7 +451,6 @@ jobs:
                       continue
 
                   print(f"==> 复制 {pkg_name}: {filename} -> {dest_path} (来源: {pkg_info['source']})")
-                  # 同样使用 copy_fresh，确保 mtime 为当前时间
                   copy_fresh(tmp_path, dest_path)
                   size = os.path.getsize(dest_path)
                   summary_lines.append(f"| {arch} | {filename} | {fmt_size(size)} |")
@@ -547,10 +520,15 @@ jobs:
 
       # =====================================================================
       # 步骤 5：清理旧版本文件
+      #   关键修复：legacy_matches 排除已匹配 final_pattern 的文件，
+      #             避免 github_pattern == final_pattern 时同一文件被误删。
       #   (a) 架构相关包：按 file_patterns 匹配，保留 mtime 最新的一个
-      #   (b) _all 通用包：优先保留 final_pattern（去前缀）匹配的文件；
-      #       若同一逻辑包存在多个 final_pattern 匹配文件，保留 mtime 最新者；
-      #       github_pattern（带前缀）匹配到的遗留文件一律删除。
+      #   (b) _all 通用包：
+      #       - final_matches：匹配 final_pattern（当前命名规范）
+      #       - legacy_matches：匹配 github_pattern 但【不匹配】final_pattern
+      #         （历史遗留的带前缀文件；当两个 pattern 相同时自动为空）
+      #       优先保留 final_matches 中 mtime 最新者；
+      #       若仅有 legacy_matches，则保留其中 mtime 最新者。
       # =====================================================================
       - name: 清理旧版本文件
         run: |
@@ -599,9 +577,14 @@ jobs:
                       f for f in all_ipks
                       if fnmatch.fnmatch(os.path.basename(f), final_pattern)
                   ]
+                  # 关键修复：legacy_matches 必须排除已匹配 final_pattern 的文件，
+                  # 否则当 github_pattern == final_pattern（如 passwall2 系列）时，
+                  # 同一文件同时进入 final_matches 和 legacy_matches，
+                  # 会导致本该保留的最新文件被当作 legacy 误删。
                   legacy_matches = [
                       f for f in all_ipks
                       if fnmatch.fnmatch(os.path.basename(f), github_pattern)
+                      and not fnmatch.fnmatch(os.path.basename(f), final_pattern)
                   ]
 
                   if final_matches:
