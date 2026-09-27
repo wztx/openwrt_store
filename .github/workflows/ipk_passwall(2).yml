@@ -3,7 +3,8 @@
 #   1. 从 SourceForge 的 openwrt-passwall-build 项目 RSS 源获取最新的 IPK 软件包信息；
 #   2. 使用 wget -qO 严格下载 RSS 与 IPK（不得添加任何多余参数，否则会触发反爬）；
 #   3. _all 通用包只下载一次，通过全局缓存复制到 x86_64 与 aarch64 两个架构目录；
-#   4. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
+#   4. 下载 IPK 时，先尝试去掉 /download 后缀的 URL；若失败，则回退到带 /download 后缀的原始 URL 再次尝试；
+#   5. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
 #      - x86_64 架构提交至 run/x86_64/luci-app-passwall/
 #      - aarch64_generic 架构提交至 run/aarch64/luci-app-passwall/
 name: 自动更新 Passwall(2) IPK 软件包
@@ -126,7 +127,9 @@ jobs:
       # 步骤 3：解析 RSS 并下载 IPK 文件
       #   - 全局收集唯一 RSS 源并去重
       #   - 一次性下载并解析所有 RSS，构建全局 URL 列表
+      #     每个条目保存两个 URL：去掉 /download 后缀的 URL 和原始带 /download 的 URL
       #   - 按架构匹配文件通配符并下载
+      #   - 下载时优先使用去掉 /download 后缀的 URL；若失败，回退到带 /download 的原始 URL
       #   - _all 通用包只下载一次，通过 downloaded_cache 复制到多个架构目录
       #   - 目标目录使用 ARCH_MATRIX 中的 target_dir 字段：
       #       x86_64          -> run/x86_64/luci-app-passwall/
@@ -174,6 +177,7 @@ jobs:
           # ---------- 2. 下载并解析所有 RSS，汇总全局 URL ----------
           # 注意：RSS 下载必须严格使用 wget -qO，不得添加多余参数，
           #       否则会触发 SourceForge/Cloudflare 反爬机制导致下载失败。
+          # 每个条目存储为字典：{"no_download": 去掉后缀的URL, "with_download": 原始URL}
           all_urls = []
           for rss_var in sorted(all_rss_vars):
               rss_url = os.environ[rss_var]
@@ -195,9 +199,13 @@ jobs:
               for item in tree.getroot().iter("item"):
                   link_elem = item.find("link")
                   if link_elem is not None and link_elem.text:
-                      # SourceForge RSS 的 <link> 可能带 /download 后缀，下载前必须去掉
-                      url = link_elem.text.replace("/download", "")
-                      all_urls.append(url)
+                      original_url = link_elem.text.strip()
+                      # SourceForge RSS 的 <link> 可能带 /download 后缀，下载前优先去掉
+                      no_download_url = original_url.replace("/download", "")
+                      all_urls.append({
+                          "no_download": no_download_url,
+                          "with_download": original_url
+                      })
                       count += 1
               print(f"==> {rss_var} 解析出 {count} 个文件 URL")
 
@@ -217,8 +225,9 @@ jobs:
 
               for pattern in file_patterns:
                   matched = False
-                  for url in all_urls:
-                      filename = url.split("/")[-1]
+                  for entry in all_urls:
+                      # 从去掉 /download 后缀的 URL 中提取文件名，确保匹配正确
+                      filename = entry["no_download"].split("/")[-1]
                       if not fnmatch.fnmatch(filename, pattern):
                           continue
 
@@ -239,12 +248,19 @@ jobs:
                           shutil.copy2(src_path, dest_path)
                       else:
                           tmp_file = os.path.join(tmp_root, filename)
-                          # IPK 下载同样严格使用 wget -qO，不得添加多余参数
-                          print(f"==> 下载: {url}")
-                          r = subprocess.run(["wget", "-qO", tmp_file, url])
+                          # 第一次尝试：去掉 /download 后缀的 URL
+                          print(f"==> 尝试下载 (无 /download 后缀): {entry['no_download']}")
+                          r = subprocess.run(["wget", "-qO", tmp_file, entry["no_download"]])
                           if r.returncode != 0:
-                              print(f"错误：下载失败 {url}", file=sys.stderr)
-                              sys.exit(1)
+                              # 回退：加回 /download 后缀的原始 URL
+                              print(f"==> 首次下载失败，回退尝试 (带 /download 后缀): {entry['with_download']}")
+                              # 清除可能残留的临时文件
+                              if os.path.exists(tmp_file):
+                                  os.remove(tmp_file)
+                              r = subprocess.run(["wget", "-qO", tmp_file, entry["with_download"]])
+                              if r.returncode != 0:
+                                  print(f"错误：下载失败（两种 URL 均不可用）: {filename}", file=sys.stderr)
+                                  sys.exit(1)
                           downloaded_cache[filename] = tmp_file
                           shutil.copy2(tmp_file, dest_path)
                           print(f"==> 保存至: {dest_path}")
