@@ -1,11 +1,15 @@
 # 工作流：自动更新 Passwall(2) IPK 软件包
 # 说明：
-#   1. 从 SourceForge 的 openwrt-passwall-build 项目 RSS 源获取 IPK 软件包信息（架构相关包）；
-#   2. 从 GitHub Releases API 获取 Passwall / Passwall2 的 _all 通用包（含预发布版）；
-#   3. 使用 wget -qO 严格下载 RSS 与 IPK（不得添加任何多余参数，否则会触发反爬）；
-#   4. _all 通用包只下载一次，通过全局缓存复制到 x86_64 与 aarch64 两个架构目录；
-#   5. 下载 IPK 时，先尝试原始 URL；若失败，则回退到带 /download 后缀的 URL 再次尝试；
-#   6. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
+#   1. 架构相关包（chinadns-ng、dns2socks、geoview、microsocks、tcping）
+#      从 SourceForge 的 openwrt-passwall-build 项目 RSS 源获取；
+#   2. 四个 _all 通用包优先从 GitHub Releases API（含预发布版）下载；
+#      若 GitHub 无匹配或下载失败，则回退到 SourceForge RSS 源；
+#   3. 从 GitHub 下载的 _all 包会自动去掉 "23.05-24.10_" 前缀后保存，
+#      确保最终产物文件名与 SourceForge 来源保持一致；
+#   4. 使用 wget -qO 严格下载 RSS 与 IPK（不得添加任何多余参数，否则会触发反爬）；
+#   5. _all 通用包只下载一次，通过全局缓存复制到 x86_64 与 aarch64 两个架构目录；
+#   6. 下载 IPK 时，先尝试去掉 /download 后缀的 URL；若失败，则回退到带 /download 后缀的原始 URL 再次尝试；
+#   7. 完成后自动提交到仓库 run/<目标目录>/luci-app-passwall/ 目录。
 #      - x86_64 架构提交至 run/x86_64/luci-app-passwall/
 #      - aarch64_generic 架构提交至 run/aarch64/luci-app-passwall/
 name: 自动更新 Passwall(2) IPK 软件包
@@ -38,53 +42,70 @@ env:
   COMMIT_MSG_TEMPLATE: "🔄自动更新 Passwall(2) IPK 软件包 | ${BUILD_TIME}(北京时间)"
   DEST_DIR: run
   PKG_DIR_NAME: luci-app-passwall
+  # GitHub 来源文件名前缀（下载后会被去掉，以统一最终产物命名）
+  GITHUB_FILENAME_PREFIX: "23.05-24.10_"
   RSS_X86_64_LUCI: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_luci/"
   RSS_X86_64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall_packages/"
   RSS_X86_64_PASSWALL2: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/x86_64/passwall2"
   RSS_AARCH64_PACKAGES: "https://sourceforge.net/projects/openwrt-passwall-build/rss?path=/releases/packages-24.10/aarch64_generic/passwall_packages/"
-  # GitHub Releases 配置：_all 通用包从 GitHub API 获取（含预发布版）
-  GITHUB_RELEASES: |
-    {
-      "repos": [
-        {
-          "repo": "Openwrt-Passwall/openwrt-passwall",
-          "file_patterns": [
-            "23.05-24.10_luci-app-passwall_*_all.ipk",
-            "23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk"
-          ]
-        },
-        {
-          "repo": "Openwrt-Passwall/openwrt-passwall2",
-          "file_patterns": [
-            "luci-app-passwall2_*_all.ipk",
-            "luci-i18n-passwall2-zh-cn_*_all.ipk"
-          ]
-        }
-      ]
-    }
+  # _all 通用包配置：定义每个包的 GitHub 优先源与 SourceForge 回退源
+  #   - github_repo / github_pattern：GitHub Releases 上的仓库与文件名通配符
+  #   - fallback_rss_var / fallback_pattern：回退到 SourceForge RSS 的源变量与文件名通配符
+  #   - final_pattern：最终保存到仓库中的文件名通配符（去前缀后）
+  ALL_PACKAGES: |
+    [
+      {
+        "name": "luci-app-passwall",
+        "github_repo": "Openwrt-Passwall/openwrt-passwall",
+        "github_pattern": "23.05-24.10_luci-app-passwall_*_all.ipk",
+        "fallback_rss_var": "RSS_X86_64_LUCI",
+        "fallback_pattern": "luci-app-passwall_*_all.ipk",
+        "final_pattern": "luci-app-passwall_*_all.ipk"
+      },
+      {
+        "name": "luci-i18n-passwall-zh-cn",
+        "github_repo": "Openwrt-Passwall/openwrt-passwall",
+        "github_pattern": "23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk",
+        "fallback_rss_var": "RSS_X86_64_LUCI",
+        "fallback_pattern": "luci-i18n-passwall-zh-cn_*_all.ipk",
+        "final_pattern": "luci-i18n-passwall-zh-cn_*_all.ipk"
+      },
+      {
+        "name": "luci-app-passwall2",
+        "github_repo": "Openwrt-Passwall/openwrt-passwall2",
+        "github_pattern": "luci-app-passwall2_*_all.ipk",
+        "fallback_rss_var": "RSS_X86_64_PASSWALL2",
+        "fallback_pattern": "luci-app-passwall2_*_all.ipk",
+        "final_pattern": "luci-app-passwall2_*_all.ipk"
+      },
+      {
+        "name": "luci-i18n-passwall2-zh-cn",
+        "github_repo": "Openwrt-Passwall/openwrt-passwall2",
+        "github_pattern": "luci-i18n-passwall2-zh-cn_*_all.ipk",
+        "fallback_rss_var": "RSS_X86_64_PASSWALL2",
+        "fallback_pattern": "luci-i18n-passwall2-zh-cn_*_all.ipk",
+        "final_pattern": "luci-i18n-passwall2-zh-cn_*_all.ipk"
+      }
+    ]
   # 架构矩阵（JSON）：定义每个架构需要从哪些 RSS 源、匹配哪些文件名通配符，
   # 以及提交时的目标目录名（target_dir）。
-  # 注意：aarch64_generic 架构的 target_dir 为 "aarch64"，即提交到 run/aarch64/ 下。
+  # 注意：
+  #   - aarch64_generic 架构的 target_dir 为 "aarch64"，即提交到 run/aarch64/ 下；
+  #   - file_patterns 仅包含架构相关包（_all 通用包在 ALL_PACKAGES 中单独处理）。
   ARCH_MATRIX: |
     [
       {
         "arch": "x86_64",
         "target_dir": "x86_64",
         "rss_feeds": [
-          "RSS_X86_64_LUCI",
-          "RSS_X86_64_PACKAGES",
-          "RSS_X86_64_PASSWALL2"
+          "RSS_X86_64_PACKAGES"
         ],
         "file_patterns": [
           "chinadns-ng_*_x86_64.ipk",
           "dns2socks_*_x86_64.ipk",
           "geoview_*_x86_64.ipk",
           "microsocks_*_x86_64.ipk",
-          "tcping_*_x86_64.ipk",
-          "luci-app-passwall_*_all.ipk",
-          "luci-i18n-passwall-zh-cn_*_all.ipk",
-          "luci-app-passwall2_*_all.ipk",
-          "luci-i18n-passwall2-zh-cn_*_all.ipk"
+          "tcping_*_x86_64.ipk"
         ]
       },
       {
@@ -98,11 +119,7 @@ env:
           "dns2socks_*_aarch64_generic.ipk",
           "geoview_*_aarch64_generic.ipk",
           "microsocks_*_aarch64_generic.ipk",
-          "tcping_*_aarch64_generic.ipk",
-          "luci-app-passwall_*_all.ipk",
-          "luci-i18n-passwall-zh-cn_*_all.ipk",
-          "luci-app-passwall2_*_all.ipk",
-          "luci-i18n-passwall2-zh-cn_*_all.ipk"
+          "tcping_*_aarch64_generic.ipk"
         ]
       }
     ]
@@ -146,15 +163,19 @@ jobs:
 
       # =====================================================================
       # 步骤 3：解析 RSS 与 GitHub Releases 并下载 IPK 文件
-      #   - 全局收集唯一 RSS 源并去重
-      #   - 一次性下载并解析所有 RSS，构建全局 URL 列表
-      #   - 调用 GitHub Releases API（含预发布版），构建 _all 通用包的 URL 列表
-      #   - 按架构匹配文件通配符并下载
-      #   - 下载时优先使用原始 URL；若失败，回退到带 /download 后缀的 URL
-      #   - _all 通用包只下载一次，通过 downloaded_cache 复制到多个架构目录
-      #   - 目标目录使用 ARCH_MATRIX 中的 target_dir 字段：
-      #       x86_64          -> run/x86_64/luci-app-passwall/
-      #       aarch64_generic -> run/aarch64/luci-app-passwall/
+      #   处理流程：
+      #     (1) 收集所有唯一 RSS 源并去重（架构相关包源 + _all 包回退源）
+      #     (2) 下载并解析所有 RSS，构建全局 URL 列表 rss_urls
+      #     (3) 调用 GitHub Releases API 获取最新版本（含预发布版）的 assets
+      #     (4) 处理四个 _all 通用包：
+      #         - 优先从 GitHub 下载；若无匹配或下载失败，回退到 SourceForge RSS
+      #         - 从 GitHub 下载时，会自动去掉 "23.05-24.10_" 前缀后再保存，
+      #           使最终文件名与 SourceForge 来源保持一致
+      #         - 每个 _all 包只下载一次，缓存到 all_pkg_downloads
+      #     (5) 遍历架构：
+      #         - 架构相关包：从 rss_urls 匹配并下载
+      #         - _all 通用包：从 all_pkg_downloads 复制到各架构目录
+      #   下载回退：先尝试去掉 /download 后缀的 URL；失败则回退到带 /download 后缀的 URL
       # =====================================================================
       - name: 解析 RSS 与 GitHub Releases 并下载 IPK 文件
         env:
@@ -182,29 +203,55 @@ jobs:
               return f"{n} B"
 
 
-          def github_api_get(url: str) -> dict:
+          def github_api_get(url: str) -> list:
               """调用 GitHub API（使用 GITHUB_TOKEN 认证以避免速率限制）"""
               req = urllib.request.Request(url)
               req.add_header("Accept", "application/vnd.github+json")
-              req.add_header("Authorization", f"Bearer {os.environ.get('GITHUB_TOKEN', '')}")
+              token = os.environ.get("GITHUB_TOKEN", "")
+              if token:
+                  req.add_header("Authorization", f"Bearer {token}")
               req.add_header("X-GitHub-Api-Version", "2022-11-28")
               try:
-                  with urllib.request.urlopen(req) as resp:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
                       return json.load(resp)
               except urllib.error.HTTPError as e:
                   print(f"错误：GitHub API 请求失败 ({url}): {e}", file=sys.stderr)
                   sys.exit(1)
+              except Exception as e:
+                  print(f"错误：GitHub API 请求异常 ({url}): {e}", file=sys.stderr)
+                  sys.exit(1)
+
+
+          def wget_try(url_no_dl: str, url_with_dl: str, out_file: str) -> bool:
+              """先尝试无 /download 后缀，失败则回退到带 /download 后缀"""
+              print(f"==> 尝试下载: {url_no_dl}")
+              r = subprocess.run(["wget", "-qO", out_file, url_no_dl])
+              if r.returncode == 0 and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                  return True
+              # 首次失败：清理残留并回退
+              if os.path.exists(out_file):
+                  os.remove(out_file)
+              if url_with_dl and url_with_dl != url_no_dl:
+                  print(f"==> 首次下载失败，回退尝试: {url_with_dl}")
+                  r = subprocess.run(["wget", "-qO", out_file, url_with_dl])
+                  if r.returncode == 0 and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                      return True
+              if os.path.exists(out_file):
+                  os.remove(out_file)
+              return False
 
 
           # ---------- 读取环境变量 ----------
           arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
-          github_releases = json.loads(os.environ["GITHUB_RELEASES"])
+          all_packages = json.loads(os.environ["ALL_PACKAGES"])
           dest_dir = os.environ["DEST_DIR"]              # run
           pkg_dir_name = os.environ["PKG_DIR_NAME"]      # luci-app-passwall
+          gh_prefix = os.environ.get("GITHUB_FILENAME_PREFIX", "")  # 23.05-24.10_
           force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
           tmp_root = "/tmp/passwall-build"
           os.makedirs(tmp_root, exist_ok=True)
           print(f"==> 强制更新标志: {force_update}")
+          print(f"==> GitHub 文件名前缀（将去除）: '{gh_prefix}'")
           print(f"==> 临时目录: {tmp_root}")
 
           # ---------- 1. 全局收集唯一 RSS 变量（去重，避免重复下载）----------
@@ -212,12 +259,16 @@ jobs:
           for arch_info in arch_matrix:
               for rss_var in arch_info["rss_feeds"]:
                   all_rss_vars.add(rss_var)
+          for pkg_cfg in all_packages:
+              fallback_var = pkg_cfg.get("fallback_rss_var")
+              if fallback_var:
+                  all_rss_vars.add(fallback_var)
           print(f"==> 全局唯一 RSS 源数量: {len(all_rss_vars)} -> {sorted(all_rss_vars)}")
 
           # ---------- 2. 下载并解析所有 RSS，汇总全局 URL ----------
           # 注意：RSS 下载必须严格使用 wget -qO，不得添加多余参数，
           #       否则会触发 SourceForge/Cloudflare 反爬机制导致下载失败。
-          all_urls = []
+          rss_urls = []  # 每条记录为 dict：{"filename", "no_download", "with_download", "source"}
           for rss_var in sorted(all_rss_vars):
               rss_url = os.environ[rss_var]
               rss_file = os.path.join(tmp_root, f"rss_{rss_var}.xml")
@@ -240,64 +291,119 @@ jobs:
                       original_url = link_elem.text.strip()
                       # SourceForge RSS 的 <link> 可能带 /download 后缀，下载前优先去掉
                       no_download_url = original_url.replace("/download", "")
-                      all_urls.append({
+                      filename = no_download_url.split("/")[-1]
+                      rss_urls.append({
+                          "filename": filename,
                           "no_download": no_download_url,
-                          "with_download": original_url
+                          "with_download": original_url,
+                          "source": f"SourceForge RSS ({rss_var})",
                       })
                       count += 1
               print(f"==> {rss_var} 解析出 {count} 个文件 URL")
 
-          print(f"==> RSS 解析完成，共获取 {len(all_urls)} 个文件 URL")
+          print(f"==> RSS 解析完成，共获取 {len(rss_urls)} 个文件 URL")
 
-          # ---------- 3. 调用 GitHub Releases API（含预发布版），构建 _all 包 URL ----------
+          # ---------- 3. 调用 GitHub Releases API（含预发布版），收集 assets ----------
           # 说明：/releases/latest 只返回最新的正式版，不包含预发布版。
           #       为获取含预发布版的最新版，改为获取 releases 列表，取第一个非草稿项。
-          for repo_cfg in github_releases["repos"]:
-              repo = repo_cfg["repo"]
-              patterns = repo_cfg["file_patterns"]
-              api_url = f"https://api.github.com/repos/{repo}/releases?per_page=10"
+          github_assets = {}   # filename -> {filename, no_download, with_download, source}
+          repos_processed = set()
+          for pkg_cfg in all_packages:
+              repo_name = pkg_cfg["github_repo"]
+              if repo_name in repos_processed:
+                  continue
+              repos_processed.add(repo_name)
+
+              api_url = f"https://api.github.com/repos/{repo_name}/releases?per_page=10"
               print(f"==> 调用 GitHub API: {api_url}")
               releases = github_api_get(api_url)
 
-              # 筛选出非草稿的 release（含预发布版），按创建时间降序排列
-              candidates = [
-                  r for r in releases
-                  if not r.get("draft", False)
-              ]
+              # 筛选非草稿 release（含预发布版），取第一个
+              candidates = [r for r in releases if not r.get("draft", False)]
               if not candidates:
-                  print(f"错误：未找到可用的 Release ({repo})", file=sys.stderr)
-                  sys.exit(1)
-
-              # 取最新的一个（含预发布版）
+                  print(f"==> 警告：{repo_name} 未找到可用 Release（跳过该 GitHub 源）")
+                  continue
               latest = candidates[0]
               tag = latest.get("tag_name", "unknown")
-              is_prerelease = latest.get("prerelease", False)
-              print(f"==> {repo} 最新 Release: tag={tag}, 预发布={is_prerelease}")
+              is_pre = latest.get("prerelease", False)
+              print(f"==> {repo_name} 最新 Release: {tag} (预发布={is_pre})")
 
-              # 从 assets 中匹配需要的文件
               for asset in latest.get("assets", []):
                   filename = asset.get("name", "")
-                  for pattern in patterns:
-                      if fnmatch.fnmatch(filename, pattern):
-                          download_url = asset.get("browser_download_url", "")
-                          if not download_url:
-                              continue
-                          # GitHub Releases 的 URL 通常不需要 /download 后缀，
-                          # 但为保持与 RSS 下载逻辑统一，仍构建回退 URL
-                          no_download_url = download_url.replace("/download", "")
-                          with_download_url = download_url
-                          all_urls.append({
-                              "no_download": no_download_url,
-                              "with_download": with_download_url
-                          })
-                          print(f"==>   [GitHub] 匹配: {filename}")
-                          break
+                  url = asset.get("browser_download_url", "")
+                  if not filename or not url:
+                      continue
+                  # GitHub Releases 的 browser_download_url 不需要 /download 后缀，
+                  # 但为保持下载逻辑统一，仍使用相同的双 URL 结构
+                  github_assets[filename] = {
+                      "filename": filename,
+                      "no_download": url,
+                      "with_download": url,
+                      "source": f"GitHub {repo_name}@{tag}",
+                  }
 
-          print(f"==> 全局 URL 汇总完成，共 {len(all_urls)} 个文件 URL")
+          print(f"==> GitHub Releases 收集完成，共 {len(github_assets)} 个 asset")
 
-          # ---------- 4. 按架构匹配并下载/复制 ----------
-          downloaded_cache = {}   # 文件名 -> 临时文件完整路径（用于 _all 通用包复用）
-          summary_lines = []      # Markdown 表格行，用于 STEP_SUMMARY
+          # ---------- 4. 处理四个 _all 通用包（GitHub 优先，SourceForge 回退）----------
+          # 每个 _all 包只下载一次，缓存到 all_pkg_downloads。
+          # 从 GitHub 下载的文件会自动去掉 GITHUB_FILENAME_PREFIX 前缀后保存，
+          # 保证最终产物文件名与 SourceForge 来源一致，便于后续清理与用户使用。
+          all_pkg_downloads = {}   # 逻辑名 -> {filename, tmp_path, source}
+          for pkg_cfg in all_packages:
+              pkg_name = pkg_cfg["name"]
+              github_pattern = pkg_cfg["github_pattern"]
+              fallback_pattern = pkg_cfg["fallback_pattern"]
+
+              # 构建候选下载源列表（按优先级排列）
+              candidates = []
+
+              # 第一优先级：GitHub Releases
+              for filename, info in github_assets.items():
+                  if fnmatch.fnmatch(filename, github_pattern):
+                      candidates.append(info)
+                      break
+
+              # 第二优先级：SourceForge RSS
+              for url_info in rss_urls:
+                  if fnmatch.fnmatch(url_info["filename"], fallback_pattern):
+                      candidates.append(url_info)
+                      break
+
+              if not candidates:
+                  print(f"==> 警告: {pkg_name} 在 GitHub 与 SourceForge 均无匹配，跳过")
+                  continue
+
+              # 依次尝试候选源
+              success = False
+              for info in candidates:
+                  filename = info["filename"]
+                  # 计算最终文件名：若来自 GitHub，则去掉 "23.05-24.10_" 前缀
+                  final_filename = filename
+                  if gh_prefix and final_filename.startswith(gh_prefix):
+                      final_filename = final_filename[len(gh_prefix):]
+                      print(f"==> 重命名: {filename} -> {final_filename}")
+
+                  # 使用最终文件名作为临时文件的保存路径（wget -qO 直接保存为该文件名）
+                  tmp_file = os.path.join(tmp_root, final_filename)
+                  print(f"==> 处理 {pkg_name}：尝试从 {info['source']} 下载，保存为: {final_filename}")
+                  if wget_try(info["no_download"], info["with_download"], tmp_file):
+                      all_pkg_downloads[pkg_name] = {
+                          "filename": final_filename,
+                          "tmp_path": tmp_file,
+                          "source": info["source"],
+                      }
+                      print(f"==> {pkg_name} 下载成功（来源: {info['source']}）")
+                      success = True
+                      break
+                  else:
+                      print(f"==> {pkg_name} 从 {info['source']} 下载失败，尝试下一源")
+
+              if not success:
+                  print(f"错误：{pkg_name} 所有源均下载失败", file=sys.stderr)
+                  sys.exit(1)
+
+          # ---------- 5. 按架构匹配并下载/复制 ----------
+          summary_lines = []   # Markdown 表格行，用于 STEP_SUMMARY
 
           for arch_info in arch_matrix:
               arch = arch_info["arch"]
@@ -307,11 +413,11 @@ jobs:
               os.makedirs(target_dir, exist_ok=True)
               print(f"==> 处理架构: {arch}，目标目录: {target_dir}")
 
+              # (a) 架构相关包：从 rss_urls 中匹配并下载
               for pattern in file_patterns:
                   matched = False
-                  for entry in all_urls:
-                      # 从去掉 /download 后缀的 URL 中提取文件名，确保匹配正确
-                      filename = entry["no_download"].split("/")[-1]
+                  for url_info in rss_urls:
+                      filename = url_info["filename"]
                       if not fnmatch.fnmatch(filename, pattern):
                           continue
 
@@ -325,28 +431,13 @@ jobs:
                           summary_lines.append(f"| {arch} | {filename} | {fmt_size(size)} |")
                           break
 
-                      # 检查全局缓存（_all 通用包只下载一次，其它架构直接从缓存复制）
-                      if filename in downloaded_cache:
-                          src_path = downloaded_cache[filename]
-                          print(f"==> 从缓存复制: {filename} -> {dest_path}")
-                          shutil.copy2(src_path, dest_path)
-                      else:
-                          tmp_file = os.path.join(tmp_root, filename)
-                          # 第一次尝试：原始 URL（去掉 /download 后缀）
-                          print(f"==> 尝试下载: {entry['no_download']}")
-                          r = subprocess.run(["wget", "-qO", tmp_file, entry["no_download"]])
-                          if r.returncode != 0:
-                              # 回退：加回 /download 后缀的原始 URL
-                              print(f"==> 首次下载失败，回退尝试: {entry['with_download']}")
-                              if os.path.exists(tmp_file):
-                                  os.remove(tmp_file)
-                              r = subprocess.run(["wget", "-qO", tmp_file, entry["with_download"]])
-                              if r.returncode != 0:
-                                  print(f"错误：下载失败（两种 URL 均不可用）: {filename}", file=sys.stderr)
-                                  sys.exit(1)
-                          downloaded_cache[filename] = tmp_file
-                          shutil.copy2(tmp_file, dest_path)
-                          print(f"==> 保存至: {dest_path}")
+                      # 下载（先用无 /download 后缀的 URL，失败回退）
+                      tmp_file = os.path.join(tmp_root, filename)
+                      if not wget_try(url_info["no_download"], url_info["with_download"], tmp_file):
+                          print(f"错误：下载失败 {filename}", file=sys.stderr)
+                          sys.exit(1)
+                      shutil.copy2(tmp_file, dest_path)
+                      print(f"==> 保存至: {dest_path}")
 
                       size = os.path.getsize(dest_path)
                       summary_lines.append(f"| {arch} | {filename} | {fmt_size(size)} |")
@@ -354,6 +445,23 @@ jobs:
 
                   if not matched:
                       print(f"==> 警告: 未找到匹配文件: {pattern}")
+
+              # (b) _all 通用包：从 all_pkg_downloads 复制到当前架构目录
+              for pkg_name, pkg_info in all_pkg_downloads.items():
+                  filename = pkg_info["filename"]   # 已经是去前缀后的最终文件名
+                  tmp_path = pkg_info["tmp_path"]
+                  dest_path = os.path.join(target_dir, filename)
+
+                  if not force_update and os.path.exists(dest_path):
+                      print(f"==> 跳过已存在 _all 包: {filename}")
+                      size = os.path.getsize(dest_path)
+                      summary_lines.append(f"| {arch} | {filename} | {fmt_size(size)} |")
+                      continue
+
+                  print(f"==> 复制 {pkg_name}: {filename} -> {dest_path} (来源: {pkg_info['source']})")
+                  shutil.copy2(tmp_path, dest_path)
+                  size = os.path.getsize(dest_path)
+                  summary_lines.append(f"| {arch} | {filename} | {fmt_size(size)} |")
 
           # 将汇总行写入临时文件，供后续步骤生成 STEP_SUMMARY
           summary_path = os.path.join(tmp_root, "summary.txt")
@@ -428,7 +536,11 @@ jobs:
 
       # =====================================================================
       # 步骤 5：清理旧版本文件
-      #   同一包名只保留最新一份（按 mtime 排序），删除其它旧版本 .ipk
+      #   同一逻辑包只保留最新一份（按 mtime 排序），删除其它旧版本 .ipk
+      #   覆盖两类包：
+      #     (a) 架构相关包：使用 file_patterns
+      #     (b) _all 通用包：使用 final_pattern（统一命名）+ 旧版 github_pattern
+      #         （兼容历史上曾以带前缀文件名提交过的文件）
       #   清理目录：run/<target_dir>/luci-app-passwall/
       # =====================================================================
       - name: 清理旧版本文件
@@ -442,6 +554,7 @@ jobs:
 
 
           arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
+          all_packages = json.loads(os.environ["ALL_PACKAGES"])
           dest_dir = os.environ["DEST_DIR"]
           pkg_dir_name = os.environ["PKG_DIR_NAME"]
 
@@ -449,23 +562,40 @@ jobs:
               arch = arch_info["arch"]
               target_dir_name = arch_info["target_dir"]
               target_dir = os.path.join(dest_dir, target_dir_name, pkg_dir_name)
-              file_patterns = arch_info["file_patterns"]
               if not os.path.isdir(target_dir):
                   print(f"==> 目录不存在，跳过: {target_dir}")
                   continue
 
               removed = 0
-              for pattern in file_patterns:
-                  # 找出同一包名（同 pattern）的所有文件
+
+              # (a) 架构相关包清理
+              for pattern in arch_info["file_patterns"]:
                   matches = [
                       f for f in glob.glob(os.path.join(target_dir, "*.ipk"))
                       if fnmatch.fnmatch(os.path.basename(f), pattern)
                   ]
-                  # 按修改时间降序，保留最新一份
                   matches.sort(key=os.path.getmtime, reverse=True)
                   for old in matches[1:]:
                       os.remove(old)
                       print(f"==> 删除旧文件: {old}")
+                      removed += 1
+
+              # (b) _all 通用包清理：
+              #     最终命名统一为 final_pattern；
+              #     同时匹配 github_pattern 以兼容历史遗留的带前缀文件。
+              for pkg_cfg in all_packages:
+                  patterns = [
+                      pkg_cfg["final_pattern"],
+                      pkg_cfg["github_pattern"],
+                  ]
+                  matches = [
+                      f for f in glob.glob(os.path.join(target_dir, "*.ipk"))
+                      if any(fnmatch.fnmatch(os.path.basename(f), p) for p in patterns)
+                  ]
+                  matches.sort(key=os.path.getmtime, reverse=True)
+                  for old in matches[1:]:
+                      os.remove(old)
+                      print(f"==> 删除旧 _all 包: {old}")
                       removed += 1
 
               print(f"==> 架构 {arch}（目录 {target_dir}）清理完成，删除 {removed} 个旧文件")
