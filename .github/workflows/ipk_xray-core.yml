@@ -1,388 +1,450 @@
-# ============================================================
-# Xray-core 自动同步打包工作流 (OpenWrt 24.10 ipk)
-# ============================================================
-name: 自动构建 Xray-core IPK 安装包
+# =============================================================================
+# 工作流名称：自动构建 xray-core IPK 安装包
+# 功能：定时或手动触发，从上游 XTLS/Xray-core 获取最新版本，
+#       下载对应架构的二进制，构建符合 OpenWrt 规范的 IPK 安装包，
+#       提交到仓库 run/<arch>/xray-core/ 目录。
+# =============================================================================
 
-# --------------------------------------------------------
-# 触发方式
-# --------------------------------------------------------
-"on":
+name: 自动构建 xray-core IPK 安装包
+
+# -----------------------------------------------------------------------------
+# 触发条件
+# 1. 定时触发：每天 UTC 22:30（北京时间次日 06:30）
+# 2. 手动触发：可勾选 force_update 强制递增发行号
+# -----------------------------------------------------------------------------
+on:
   schedule:
-    # 每天 UTC 22:30 执行（北京时间 06:30）
-    - cron: "30 22 * * *"
+    - cron: '30 22 * * *'
   workflow_dispatch:
     inputs:
       force_update:
-        description: 是否强制更新（即使版本未变化也重新打包）
+        description: '强制更新（发行号递增）'
         required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
+        default: false
+        type: boolean
 
-# --------------------------------------------------------
-# 并发限制：同组任务最多 1 个，不取消正在进行中的任务
-# --------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 并发控制：同一工作流同一分支不取消进行中的任务
+# -----------------------------------------------------------------------------
 concurrency:
-  group: xray-core-sync-group
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# -----------------------------------------------------------------------------
+# 权限：需要写权限以提交构建产物
+# -----------------------------------------------------------------------------
 permissions:
   contents: write
 
+# -----------------------------------------------------------------------------
+# 全局环境变量：固定配置，不随运行变化
+# -----------------------------------------------------------------------------
 env:
-  USER_AGENT: "Mozilla/5.0 (Xray-core-Sync-Bot; +https://github.com) xray-core-updater/1.0"
-  API_URL: "https://api.github.com/repos/XTLS/Xray-core/releases"
-  TZ: "Asia/Shanghai"
+  UPSTREAM_API: https://api.github.com/repos/XTLS/Xray-core/releases
+  PKG_NAME: xray-core
+  PKG_DIR_NAME: xray-core
+  TZ: Asia/Shanghai
+  ARCH_MATRIX: |
+    [
+      {
+        "arch": "x86_64",
+        "asset": "Xray-linux-64.zip",
+        "extract": "xray",
+        "dest_dir": "run/x86_64",
+        "control_arch": "x86_64"
+      },
+      {
+        "arch": "aarch64_generic",
+        "asset": "Xray-linux-arm64-v8a.zip",
+        "extract": "xray",
+        "dest_dir": "run/aarch64",
+        "control_arch": "aarch64_generic"
+      }
+    ]
+  COMMIT_MSG_TEMPLATE: "🔄自动构建 ${PKG_NAME}_${VERSION}-${RELEASE} | ${BUILD_TIME}(北京时间)"
 
+# =============================================================================
+# 作业定义
+# =============================================================================
 jobs:
-  sync-and-build:
-    name: 同步版本并构建 IPK 包
+  # ---------------------------------------------------------------------------
+  # 准备作业：获取上游版本、读取触发参数、计算各架构发行号
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: 准备构建参数
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      build_matrix: ${{ steps.check_versions.outputs.build_matrix }}
+      build_count: ${{ steps.check_versions.outputs.build_count }}
     steps:
-      # --------------------------------------------------------
-      # 1. 检出仓库代码
-      # --------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 步骤 1：检出仓库代码
+      # -----------------------------------------------------------------------
       - name: 检出仓库代码
         uses: actions/checkout@v7
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+        # 作用：获取仓库文件，用于版本对比、提交变更
 
-      # --------------------------------------------------------
-      # 2. 获取上游最新版本号（含预发布/测试版）
-      # --------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 步骤 2：获取上游最新版本号
+      # -----------------------------------------------------------------------
       - name: 获取上游最新版本号
         id: get_version
+        shell: bash
         run: |
-          echo "正在请求 Xray-core 发布列表..."
-          response=$(curl -sSL --retry 3 -A "${USER_AGENT}" "${API_URL}")
-          if [ -z "$response" ]; then
-            echo "❌ 获取版本信息失败：API 无响应"
-            exit 1
-          fi
-          version=$(echo "$response" | jq -r '.[0].tag_name')
-          if [ -z "$version" ] || [ "$version" = "null" ]; then
-            echo "❌ 解析版本号失败，API 返回：$response"
-            exit 1
-          fi
-          echo "✅ 上游最新版本：${version}"
-          echo "latest_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "开始获取上游最新版本号..."
+          python3 - <<'PY'
+          import json, urllib.request, os
+          api = os.environ["UPSTREAM_API"]
+          # 必须设置 User-Agent，避免被 GitHub API 拦截
+          req = urllib.request.Request(api, headers={"User-Agent": "xray-core-ipk-builder"})
+          with urllib.request.urlopen(req) as resp:
+              releases = json.load(resp)
+          # 过滤 draft，按 published_at 降序排序，取最新 release
+          releases = [r for r in releases if not r.get("draft")]
+          releases.sort(key=lambda r: r["published_at"], reverse=True)
+          tag = releases[0]["tag_name"]
+          version = tag.lstrip("v")  # 去掉 v 前缀
+          # 写入 GITHUB_ENV 供后续步骤使用
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"VERSION={version}\n")
+          # 写入 GITHUB_OUTPUT 供作业输出使用
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\n")
+          print(f"获取到上游最新版本：{version}")
+          PY
+          echo "版本号已写入环境变量 VERSION"
 
-      # --------------------------------------------------------
-      # 3. 读取触发参数
-      # --------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 步骤 3：读取触发参数
+      # -----------------------------------------------------------------------
       - name: 读取触发参数
-        id: params
+        id: read_inputs
+        shell: bash
         run: |
-          force="${{ inputs.force_update }}"
-          if [ -z "$force" ]; then force="false"; fi
-          echo "force_update=${force}" >> "$GITHUB_OUTPUT"
-          echo "强制更新：${force}"
+          echo "读取触发参数 force_update..."
+          # 手动触发时 inputs.force_update 可用，定时触发时为默认值 false
+          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+          echo "FORCE_UPDATE=$FORCE_UPDATE" >> "$GITHUB_ENV"
+          echo "force_update=$FORCE_UPDATE" >> "$GITHUB_OUTPUT"
+          echo "force_update 当前值：$FORCE_UPDATE"
 
-      # --------------------------------------------------------
-      # 4. 版本对比（纯文件名对比）
-      # --------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 步骤 4：版本对比检查
+      # -----------------------------------------------------------------------
       - name: 版本对比检查
-        id: check
+        id: check_versions
+        shell: bash
         run: |
-          ver="${{ steps.get_version.outputs.latest_version }}"
-          force="${{ steps.params.outputs.force_update }}"
+          echo "开始版本对比检查..."
+          python3 - <<'PY'
+          import json, os, glob, re
+          arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
+          version = os.environ["VERSION"]
+          force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
+          pkg_name = os.environ["PKG_NAME"]
+          pkg_dir_name = os.environ["PKG_DIR_NAME"]
+          build_matrix = []
+          print(f"当前版本：{version}，强制更新：{force_update}")
+          for item in arch_matrix:
+              arch = item["arch"]
+              dest_dir = item["dest_dir"]
+              target_dir = os.path.join(dest_dir, pkg_dir_name)
+              pattern = os.path.join(target_dir, f"{pkg_name}_{version}-*_{arch}.ipk")
+              files = glob.glob(pattern)
+              if files:
+                  if not force_update:
+                      print(f"架构 {arch}：已存在同版本文件，跳过构建")
+                      continue
+                  # 强制更新：提取已有最大发行号
+                  releases = []
+                  for f in files:
+                      base = os.path.basename(f)
+                      m = re.match(rf"^{re.escape(pkg_name)}_{re.escape(version)}-(\d+)_{re.escape(arch)}\.ipk$", base)
+                      if m:
+                          releases.append(int(m.group(1)))
+                  release = max(releases) + 1 if releases else 1
+                  print(f"架构 {arch}：强制更新，新发行号 {release}")
+              else:
+                  release = 1
+                  print(f"架构 {arch}：未找到同版本文件，发行号 1")
+              new_item = dict(item)
+              new_item["release"] = release
+              build_matrix.append(new_item)
+          output = json.dumps(build_matrix, ensure_ascii=False)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"build_matrix={output}\n")
+              f.write(f"build_count={len(build_matrix)}\n")
+          print(f"待构建架构数量：{len(build_matrix)}")
+          PY
+          echo "版本对比检查完成"
 
-          x86_file="run/x86_64/xray-core/xray-core_${ver}-1_x86_64.ipk"
-          arm_file="run/aarch64/xray-core/xray-core_${ver}-1_aarch64.ipk"
+  # ---------------------------------------------------------------------------
+  # 构建作业：下载、构建 IPK、校验、提交
+  # ---------------------------------------------------------------------------
+  build:
+    name: 构建并提交 IPK
+    needs: prepare
+    if: ${{ needs.prepare.outputs.build_count != '0' }}
+    runs-on: ubuntu-latest
+    steps:
+      # -----------------------------------------------------------------------
+      # 步骤 1：检出仓库代码
+      # -----------------------------------------------------------------------
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-          echo "期望文件："
-          echo "  - ${x86_file}"
-          echo "  - ${arm_file}"
-
-          if [ "$force" = "true" ]; then
-            echo "🔧 强制更新模式：跳过存在性检查"
-            echo "need_build=true" >> "$GITHUB_OUTPUT"
-          elif [ -f "$x86_file" ] && [ -f "$arm_file" ]; then
-            echo "⏭️  当前版本 ${ver} 的两个架构包均已存在，无需构建。"
-            echo "need_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "🔄 需要构建新版本 ${ver}"
-            echo "need_build=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # --------------------------------------------------------
-      # 5. 下载并打包 IPK（关键修复：使用 tar.gz 最外层格式）
-      # --------------------------------------------------------
-      - name: 下载二进制并构建 IPK 包
-        if: steps.check.outputs.need_build == 'true'
+      # -----------------------------------------------------------------------
+      # 步骤 2：设置构建环境变量
+      # -----------------------------------------------------------------------
+      - name: 设置构建环境变量
+        shell: bash
+        env:
+          VERSION_FROM_PREPARE: ${{ needs.prepare.outputs.version }}
+          BUILD_MATRIX_FROM_PREPARE: ${{ needs.prepare.outputs.build_matrix }}
         run: |
-          set -euo pipefail
+          echo "设置构建环境变量..."
+          echo "VERSION=$VERSION_FROM_PREPARE" >> "$GITHUB_ENV"
+          echo "BUILD_MATRIX=$BUILD_MATRIX_FROM_PREPARE" >> "$GITHUB_ENV"
+          BUILD_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
+          echo "TIMESTAMP=$TIMESTAMP" >> "$GITHUB_ENV"
+          RELEASE=$(echo "$BUILD_MATRIX_FROM_PREPARE" | jq -r '.[0].release // 1')
+          echo "RELEASE=$RELEASE" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION_FROM_PREPARE"
+          echo "BUILD_TIME=$BUILD_TIME"
+          echo "TIMESTAMP=$TIMESTAMP"
+          echo "RELEASE(取自首个架构)=$RELEASE"
 
-          WORK_DIR="$(pwd)"
-          TMPDIR="$(mktemp -d)"
-          trap 'echo "🧹 清理临时文件..."; rm -rf "$TMPDIR"' EXIT
+      # -----------------------------------------------------------------------
+      # 步骤 3：获取上游下载地址
+      # -----------------------------------------------------------------------
+      - name: 获取上游下载地址
+        shell: bash
+        env:
+          VERSION_FROM_PREPARE: ${{ needs.prepare.outputs.version }}
+        run: |
+          echo "开始获取上游下载地址..."
+          python3 - <<'PY'
+          import json, os, urllib.request
+          api = os.environ["UPSTREAM_API"]
+          version = os.environ["VERSION_FROM_PREPARE"]
+          req = urllib.request.Request(api, headers={"User-Agent": "xray-core-ipk-builder"})
+          with urllib.request.urlopen(req) as resp:
+              releases = json.load(resp)
+          releases = [r for r in releases if not r.get("draft")]
+          target = None
+          for r in releases:
+              if r["tag_name"].lstrip("v") == version:
+                  target = r
+                  break
+          if not target:
+              raise SystemExit(f"未找到版本 {version} 的 release")
+          urls = {a["name"]: a["browser_download_url"] for a in target.get("assets", [])}
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("ASSET_URLS=" + json.dumps(urls, ensure_ascii=False) + "\n")
+          print(f"获取到 {len(urls)} 个资产下载地址")
+          PY
+          echo "下载地址已写入环境变量 ASSET_URLS"
 
-          ver="${{ steps.get_version.outputs.latest_version }}"
-          echo "============================================"
-          echo "开始构建 Xray-core ${ver}"
-          echo "临时目录：$TMPDIR"
-          echo "============================================"
-
-          DOWNLOAD_BASE="https://github.com/XTLS/Xray-core/releases/download/${ver}"
-
-          # --- 架构配置映射表：(zip文件名 => ipk架构名 => 输出目录名) ---
-          declare -A ARCH_ZIP=(
-            ["x86_64"]="Xray-linux-64"
-            ["aarch64"]="Xray-linux-arm64-v8a"
-          )
-          declare -A ARCH_OUTDIR=(
-            ["x86_64"]="run/x86_64/xray-core"
-            ["aarch64"]="run/aarch64/xray-core"
-          )
-
-          for ipk_arch in x86_64 aarch64; do
-            zip_name="${ARCH_ZIP[$ipk_arch]}"
-            out_dir="${ARCH_OUTDIR[$ipk_arch]}"
-
-            echo ""
-            echo "--------------------------------------------"
-            echo "▶ 处理架构：${ipk_arch} (zip: ${zip_name}.zip)"
-            echo "--------------------------------------------"
-
-            # 5.1 下载
-            zip_url="${DOWNLOAD_BASE}/${zip_name}.zip"
-            echo "下载：${zip_url}"
-            curl -sSL --retry 3 -A "${USER_AGENT}" -o "${TMPDIR}/pkg.zip" "$zip_url"
-
-            # 5.2 解压：只提取 xray 二进制，其余全部丢弃
-            pkg_build="${TMPDIR}/build_${ipk_arch}"
-            mkdir -p "${pkg_build}/data/usr/bin"
-            unzip -oj "${TMPDIR}/pkg.zip" "xray" -d "${pkg_build}/data/usr/bin/"
-            chmod 0755 "${pkg_build}/data/usr/bin/xray"
-            rm -f "${TMPDIR}/pkg.zip"
-            echo "✅ 已提取 xray 二进制到 data/usr/bin/xray"
-
-            # 5.3 构建 data.tar.gz（对齐 OpenWrt 官方 ipkg-build：cd 后 tar . 自动带 ./ 前缀）
+      # -----------------------------------------------------------------------
+      # 步骤 4：下载并构建 IPK 安装包
+      # -----------------------------------------------------------------------
+      - name: 下载并构建 IPK 安装包
+        shell: bash
+        run: |
+          echo "开始构建 IPK 安装包..."
+          echo "当前版本：${VERSION}"
+          echo "待构建架构数量：$(echo "$BUILD_MATRIX" | jq 'length')"
+          # 校验 BUILD_MATRIX 是否为有效数组
+          echo "$BUILD_MATRIX" | jq -e 'type == "array"' >/dev/null || { echo "BUILD_MATRIX 不是有效数组"; exit 1; }
+          FIRST_RELEASE=""
+          # 遍历每个待构建架构
+          while IFS= read -r item; do
+            ARCH=$(echo "$item" | jq -r '.arch')
+            ASSET=$(echo "$item" | jq -r '.asset')
+            EXTRACT=$(echo "$item" | jq -r '.extract')
+            DEST_DIR=$(echo "$item" | jq -r '.dest_dir')
+            CONTROL_ARCH=$(echo "$item" | jq -r '.control_arch')
+            RELEASE=$(echo "$item" | jq -r '.release')
+            if [ -z "$FIRST_RELEASE" ]; then
+              FIRST_RELEASE="$RELEASE"
+            fi
+            PKG_FILE="${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk"
+            TMP_DIR="/tmp/xray-build/${ARCH}"
+            STAGE_DIR="${TMP_DIR}/stage"
+            # 获取下载 URL
+            URL=$(echo "$ASSET_URLS" | jq -r --arg asset "$ASSET" '.[$asset] // empty')
+            if [ -z "$URL" ]; then
+              echo "未找到资产下载地址：$ASSET"
+              exit 1
+            fi
+            echo "==== 开始处理架构：${ARCH}，发行号：${RELEASE} ===="
+            echo "下载地址：$URL"
+            echo "临时目录：$TMP_DIR"
+            # 清理并创建临时目录
+            rm -rf "$TMP_DIR"
+            mkdir -p "$TMP_DIR" || exit 1
+            # 下载压缩包，必须带 User-Agent
+            echo "下载 $ASSET ..."
+            curl -L -H "User-Agent: xray-core-ipk-builder" -o "$TMP_DIR/$ASSET" "$URL" || exit 1
+            # 解压提取二进制
+            echo "解压提取 $EXTRACT ..."
+            unzip -o "$TMP_DIR/$ASSET" "$EXTRACT" -d "$TMP_DIR" || exit 1
+            BIN="$TMP_DIR/$EXTRACT"
+            if [ ! -f "$BIN" ]; then
+              echo "未找到解压文件：$BIN"
+              exit 1
+            fi
+            # ELF 头校验
+            echo "校验 ELF 头 ..."
+            magic=$(od -An -tx1 -N4 "$BIN" | tr -d ' \n')
+            if [ "$magic" != "7f454c46" ]; then
+              echo "ELF 头校验失败：$magic"
+              exit 1
+            fi
+            echo "ELF 头校验通过：$magic"
+            # 创建 stage 目录结构
+            rm -rf "$STAGE_DIR"
+            mkdir -p "$STAGE_DIR/data/usr/bin" "$STAGE_DIR/control" || exit 1
+            cp "$BIN" "$STAGE_DIR/data/usr/bin/xray" || exit 1
+            chmod 755 "$STAGE_DIR/data/usr/bin/xray" || exit 1
+            # 计算安装大小（KB）
+            INSTALLED_SIZE=$(du -k -s "$STAGE_DIR/data/usr/bin/xray" | awk '{print $1}')
+            echo "安装大小：${INSTALLED_SIZE} KB"
+            # 生成 control 文件（使用 echo 逐行写入，避免 heredoc 缩进问题）
+            echo "生成 control 文件 ..."
+            {
+              echo "Package: ${PKG_NAME}"
+              echo "Version: ${VERSION}-${RELEASE}"
+              echo "Depends: libc"
+              echo "Source: https://github.com/XTLS/Xray-core"
+              echo "SourceName: ${PKG_NAME}"
+              echo "License: MPL-2.0"
+              echo "Section: net"
+              echo "Priority: optional"
+              echo "Architecture: ${CONTROL_ARCH}"
+              echo "Installed-Size: ${INSTALLED_SIZE}"
+              echo "Maintainer: OpenWrt <openwrt@example.com>"
+              echo "Description: Xray-core is a platform for building proxies to bypass network restrictions."
+            } > "$STAGE_DIR/control/control"
+            # 生成 postinst 文件（chmod 失败也继续执行）
+            echo "生成 postinst 文件 ..."
+            {
+              echo "#!/bin/sh"
+              echo '[ -n "$IPKG_INSTROOT" ] && exit 0'
+              echo "chmod 755 /usr/bin/xray || true"
+              echo "exit 0"
+            } > "$STAGE_DIR/control/postinst"
+            chmod 755 "$STAGE_DIR/control/postinst" || exit 1
+            # 生成 debian-binary
+            printf '2.0\n' > "$STAGE_DIR/debian-binary" || exit 1
+            # 打包 data.tar.gz
             echo "打包 data.tar.gz ..."
-            ( cd "${pkg_build}/data" && tar -czf "${pkg_build}/data.tar.gz" \
-                --numeric-owner --owner=0 --group=0 . )
-
-            # 5.4 写入 control 文件和 postinst 脚本（使用 printf 避免 YAML heredoc 解析陷阱）
-            ctrl_dir="${pkg_build}/control"
-            mkdir -p "$ctrl_dir"
-            installed_size=$(du -k "${pkg_build}/data/usr/bin/xray" | cut -f1)
-
-            printf '%s\n' \
-              "Package: xray-core" \
-              "Version: ${ver}-1" \
-              "Depends: libc" \
-              "Source: XTLS/Xray-core" \
-              "License: MPL-2.0" \
-              "Section: net" \
-              "Priority: optional" \
-              "Architecture: ${ipk_arch}" \
-              "Installed-Size: ${installed_size}" \
-              "Maintainer: xray-core-sync-bot" \
-              "Description: Xray-core is a v2ray-core fork with XTLS support." \
-              " Xray is a platform for building proxies to bypass network restrictions." \
-              > "${ctrl_dir}/control"
-            echo "✅ control 文件已写入"
-
-            printf '%s\n' \
-              "#!/bin/sh" \
-              '[ -n "$IPKG_INSTROOT" ] || {' \
-              "  chmod 0755 /usr/bin/xray 2>/dev/null || true" \
-              "}" \
-              "exit 0" \
-              > "${ctrl_dir}/postinst"
-            chmod 0755 "${ctrl_dir}/postinst"
-            echo "✅ postinst 脚本已写入"
-
-            # 5.5 构建 control.tar.gz（同样用 tar . 带 ./ 前缀）
+            (cd "$STAGE_DIR/data" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf ../data.tar.gz .) || exit 1
+            # 打包 control.tar.gz
             echo "打包 control.tar.gz ..."
-            ( cd "$ctrl_dir" && tar -czf "${pkg_build}/control.tar.gz" \
-                --numeric-owner --owner=0 --group=0 . )
-
-            # 5.6 写入 debian-binary（必须以换行结尾）
-            printf '2.0\n' > "${pkg_build}/debian-binary"
-
-            # 5.7 最终打包 IPK
-            #     ★ 关键修复：最外层必须是 tar.gz（OpenWrt ipk 规范），不是 Debian 的 ar 格式！
-            #     顺序必须为：debian-binary → control.tar.gz → data.tar.gz（带 ./ 前缀）
-            mkdir -p "$out_dir"
-            ipk_path="${out_dir}/xray-core_${ver}-1_${ipk_arch}.ipk"
-
-            echo "最终打包 ${ipk_path} ..."
-            ( cd "$pkg_build" && tar -czf "${WORK_DIR}/${ipk_path}" \
-                --numeric-owner --owner=0 --group=0 \
-                ./debian-binary ./control.tar.gz ./data.tar.gz )
-            echo "✅ IPK 已生成：${ipk_path} ($(du -h "${ipk_path}" | cut -f1))"
-          done
-
-          echo ""
-          echo "============================================"
-          echo "🎉 所有架构打包完成"
-          echo "============================================"
-
-      # --------------------------------------------------------
-      # 6. 清理本工作流相关旧版本文件（精确匹配，不碰其他文件）
-      # --------------------------------------------------------
-      - name: 清理旧版本文件
-        if: steps.check.outputs.need_build == 'true'
-        run: |
-          set -euo pipefail
-          ver="${{ steps.get_version.outputs.latest_version }}"
-
-          echo "清理旧版本 IPK（保留当前版本 ${ver}）..."
-          for out_dir in "run/x86_64/xray-core" "run/aarch64/xray-core"; do
-            if [ -d "$out_dir" ]; then
-              cd "$out_dir"
-              # 精确匹配 xray-core_*.ipk，只删除非当前版本（用 bash 内置模式匹配避免 grep SIGPIPE）
-              for f in xray-core_*.ipk; do
-                [ -e "$f" ] || continue
-                case "$f" in
-                  *"_${ver}-1_"*)
-                  echo "  保留：$f"
-                    ;;
-                  *)
-                  echo "  删除：$f"
-                  rm -f -- "$f"
-                    ;;
-                esac
-              done
-              cd - >/dev/null
-            fi
-          done
-          echo "✅ 旧版本清理完毕"
-
-      # --------------------------------------------------------
-      # 7. IPK 完整性校验
-      # --------------------------------------------------------
-      - name: IPK 完整性校验
-        if: steps.check.outputs.need_build == 'true'
-        run: |
-          # 注意：这里不要加 pipefail。校验过程中会有大量 `tar | grep -q` / `tar | dd` 管道，
-          # grep/dd 提前关闭时上游 tar 会收到 SIGPIPE，这属于正常情况，不是失败。
-          # 我们用 all_ok 变量显式校验结果即可。
-          set -eu
-          ver="${{ steps.get_version.outputs.latest_version }}"
-          all_ok=true
-
-          for ipk_arch in x86_64 aarch64; do
-            ipk_path=""
-            if [ "$ipk_arch" = "x86_64" ]; then
-              ipk_path="run/x86_64/xray-core/xray-core_${ver}-1_x86_64.ipk"
-            else
-              ipk_path="run/aarch64/xray-core/xray-core_${ver}-1_aarch64.ipk"
-            fi
-
-            echo "--------------------------------------------"
-            echo "校验：${ipk_path}"
-            echo "--------------------------------------------"
-
-            # 7.1 文件存在
-            if [ ! -f "$ipk_path" ]; then
-              echo "❌ 文件不存在"
-              all_ok=false; continue
-            fi
-            fsize=$(stat -c%s "$ipk_path")
-            echo "  文件大小：${fsize} 字节"
-            if [ "$fsize" -lt 1048576 ]; then
-              echo "❌ 文件过小 (<1MB)，可能打包异常"
-              all_ok=false; continue
-            fi
-
-            # 7.2 文件类型应为 gzip compressed data（OpenWrt ipk 最外层是 tar.gz，不是 ar/deb）
-            ftype=$(file -b "$ipk_path")
-            echo "  文件类型：${ftype}"
-            if ! echo "$ftype" | grep -qi "gzip"; then
-              echo "❌ 文件类型异常：预期 gzip compressed，实际 ${ftype}"
-              all_ok=false; continue
-            fi
-
-            # 7.3 最外层 tar 应包含三个固定名称的成员（带 ./ 前缀，符合 OpenWrt ipk 规范）
-            members=$(tar -tzf "$ipk_path")
-            echo "  tar 成员列表："
-            echo "$members" | sed 's/^/    /'
-            for need in ./debian-binary ./control.tar.gz ./data.tar.gz; do
-              if ! echo "$members" | grep -Fxq "$need"; then
-                echo "❌ 缺少必需成员：${need}"
-                all_ok=false
+            (cd "$STAGE_DIR/control" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf ../control.tar.gz .) || exit 1
+            # 打包外层 IPK（tar.gz，成员顺序固定）
+            echo "打包外层 IPK ..."
+            (cd "$STAGE_DIR" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf "$TMP_DIR/$PKG_FILE" ./debian-binary ./data.tar.gz ./control.tar.gz) || exit 1
+            # 移动到目标目录
+            DEST_PATH="${DEST_DIR}/${PKG_DIR_NAME}"
+            mkdir -p "$DEST_PATH" || exit 1
+            mv "$TMP_DIR/$PKG_FILE" "$DEST_PATH/$PKG_FILE" || exit 1
+            echo "IPK 已生成：${DEST_PATH}/${PKG_FILE}"
+            # IPK 完整性校验
+            echo "开始 IPK 完整性校验 ..."
+            tar -tzf "$DEST_PATH/$PKG_FILE" > "$TMP_DIR/list.txt" || exit 1
+            head -n 3 "$TMP_DIR/list.txt"
+            expected=("./debian-binary" "./data.tar.gz" "./control.tar.gz")
+            actual=($(head -n 3 "$TMP_DIR/list.txt"))
+            for i in 0 1 2; do
+              if [ "${actual[$i]}" != "${expected[$i]}" ]; then
+                echo "IPK 外层成员顺序错误：期望 ${expected[$i]}，实际 ${actual[$i]}"
+                exit 1
               fi
             done
-
-            # 7.4 debian-binary 内容应为 2.0
-            dbv=$(tar -xzf "$ipk_path" -O ./debian-binary | tr -d '\r\n' )
-            echo "  debian-binary：'${dbv}'"
-            if [ "$dbv" != "2.0" ]; then
-              echo "❌ debian-binary 内容异常：'${dbv}'"
-              all_ok=false
+            echo "外层成员顺序正确"
+            # 模拟 ImageBuilder 环境执行 postinst
+            rm -rf /tmp/ipk-test
+            mkdir -p /tmp/ipk-test || exit 1
+            tar -xzf "$DEST_PATH/$PKG_FILE" -C /tmp/ipk-test || exit 1
+            mkdir -p /tmp/ipk-test/control || exit 1
+            tar -xzf /tmp/ipk-test/control.tar.gz -C /tmp/ipk-test/control || exit 1
+            IPKG_INSTROOT=/tmp/ipk-test sh /tmp/ipk-test/control/postinst || exit 1
+            echo "postinst 模拟执行通过"
+            # 二次 ELF 头校验
+            magic2=$(od -An -tx1 -N4 "$STAGE_DIR/data/usr/bin/xray" | tr -d ' \n')
+            if [ "$magic2" != "7f454c46" ]; then
+              echo "二次 ELF 头校验失败：$magic2"
+              exit 1
             fi
-
-            # 7.5 control.tar.gz 中包含 control 文件（内部路径同样带 ./ 前缀）
-            if ! tar -xzf "$ipk_path" -O ./control.tar.gz | tar -tz | grep -qx "./control"; then
-              echo "❌ control.tar.gz 中缺少 control 文件"
-              all_ok=false; continue
-            fi
-
-            # 7.6 data.tar.gz 中应包含 ./usr/bin/xray
-            if ! tar -xzf "$ipk_path" -O ./data.tar.gz | tar -tz | grep -q "./usr/bin/xray$"; then
-              echo "❌ data.tar.gz 中未找到 ./usr/bin/xray"
-              all_ok=false; continue
-            fi
-
-            # 7.7 data.tar.gz 中的 xray 应是可执行 ELF（用 dd 取前 4 字节，避免 head 触发 SIGPIPE）
-            # 注意：不能用 `... | head -c 4`，在 pipefail 下 head 提前关闭管道会导致 tar 收到 SIGPIPE 并 exit 2
-            xray_header=$(tar -xzf "$ipk_path" -O ./data.tar.gz \
-                            | (tar -xzO ./usr/bin/xray 2>/dev/null || true) \
-                            | dd bs=1 count=4 status=none 2>/dev/null \
-                            | od -An -tx1 | tr -d ' \n')
-            echo "  xray 文件头(hex)：${xray_header}"
-            if [ "$xray_header" != "7f454c46" ]; then
-              echo "❌ 不是有效的 ELF 文件（header: ${xray_header}）"
-              all_ok=false; continue
-            fi
-
-            echo "✅ ${ipk_arch} 校验通过"
-          done
-
-          if [ "$all_ok" != "true" ]; then
-            echo ""
-            echo "❌ 完整性校验失败，终止提交。"
-            exit 1
-          fi
-          echo ""
-          echo "🎉 所有 IPK 校验通过"
-
-      # --------------------------------------------------------
-      # 8. 提交并推送到仓库
-      # --------------------------------------------------------
-      - name: 提交并推送
-        if: steps.check.outputs.need_build == 'true'
-        run: |
-          set -euo pipefail
-          ver="${{ steps.get_version.outputs.latest_version }}"
-          bj_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add run/x86_64/xray-core/ run/aarch64/xray-core/
-
+            echo "二次 ELF 头校验通过"
+            # 清理同架构旧版本文件
+            for f in "$DEST_PATH"/*.ipk; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+                "${PKG_FILE}") ;; # 保留本次文件
+                "${PKG_NAME}_"*"_${ARCH}.ipk") rm -f "$f" ;; # 删除同架构旧版本
+                *) ;;
+              esac
+            done
+            echo "旧版本文件已清理"
+            echo "构建完成：${DEST_PATH}/${PKG_FILE}"
+            echo "- 构建完成：\`${DEST_PATH}/${PKG_FILE}\`" >> "$GITHUB_STEP_SUMMARY"
+          done < <(echo "$BUILD_MATRIX" | jq -c '.[]')
+          # 配置 git 并提交
+          echo "配置 git 用户..."
+          git config user.name "github-actions[bot]" || exit 1
+          git config user.email "github-actions[bot]@users.noreply.github.com" || exit 1
+          echo "添加变更..."
+          git add . || exit 1
           if git diff --cached --quiet; then
-            echo "⏭️  无文件变更，跳过提交。"
+            echo "无变更，跳过提交"
           else
-            commit_msg="🔄自动构建 Xray-core ${ver} | ${bj_time}(北京时间)"
-            git commit -m "$commit_msg"
-            git push
-            echo "✅ 已推送：${commit_msg}"
+            COMMIT_MSG="🔄自动构建 ${PKG_NAME}_${VERSION}-${FIRST_RELEASE} | ${BUILD_TIME}(北京时间)"
+            echo "提交信息：$COMMIT_MSG"
+            git commit -m "$COMMIT_MSG" || exit 1
+            echo "推送到远程仓库..."
+            git push || exit 1
           fi
 
-      # --------------------------------------------------------
-      # 9. 执行总结
-      # --------------------------------------------------------
-      - name: 执行总结
+      # -----------------------------------------------------------------------
+      # 步骤 5：结果总结
+      # -----------------------------------------------------------------------
+      - name: 结果总结
         if: always()
+        shell: bash
         run: |
-          echo "============================================"
-          echo "工作流执行完毕"
-          echo "版本：${{ steps.get_version.outputs.latest_version }}"
-          echo "是否构建：${{ steps.check.outputs.need_build }}"
-          echo "============================================"
+          echo "生成构建结果总结..."
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "- 版本：${VERSION}"
+            echo "- 构建时间：${BUILD_TIME}"
+            echo "- 待构建架构："
+            echo '```'
+            echo "$BUILD_MATRIX" | jq -r '.[] | "- \(.arch)（发行号 \(.release)）"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "结果总结已写入 GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 步骤 6：清理缓存和临时文件
+      # -----------------------------------------------------------------------
+      - name: 清理缓存和临时文件
+        if: always()
+        shell: bash
+        run: |
+          echo "清理临时目录..."
+          rm -rf /tmp/xray-build /tmp/ipk-test || true
+          echo "清理完成"

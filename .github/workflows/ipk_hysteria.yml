@@ -1,273 +1,440 @@
-# =============================================================
-# Hysteria OpenWrt IPK 自动构建与同步工作流
-# 功能：定时检查上游最新版本（含预发布版），自动构建IPK并同步到本仓库
-# 构建环境：OpenWrt 24.10
-# =============================================================
-name: "自动构建 Hysteria IPK 安装包"
+name: 自动构建 hysteria IPK 安装包
 
-"on":
+# 定时触发：每天 UTC 22:32，即北京时间次日 06:32。
+on:
   schedule:
-    - cron: '32 22 * * *'		# 每天 UTC 时间 22:32（北京时间 06:32）定时触发
+    - cron: '32 22 * * *'
+  # 手动触发：可勾选 force_update，true 时递增发行号。
   workflow_dispatch:
     inputs:
       force_update:
-        description: "强制更新（忽略版本检查，重新构建）"
+        description: '是否强制更新（true 时递增发行号）'
         required: false
-        type: boolean
         default: false
+        type: boolean
 
+# 同一工作流同一 ref 不并发取消，避免提交冲突。
 concurrency:
-  group: "hysteria-build"
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# 需要写权限以提交构建产物。
 permissions:
   contents: write
 
+env:
+  # 上游 release API。
+  UPSTREAM_API: https://api.github.com/repos/HyNetworks/hysteria/releases
+  # 包名与目录名。
+  PKG_NAME: hysteria
+  PKG_DIR_NAME: hysteria-core
+  # 时区，用于北京时间构建信息。
+  TZ: Asia/Shanghai
+  # 架构矩阵：asset 必须与上游 release 资产名完全一致。
+  ARCH_MATRIX: |
+    [
+      {
+        "arch": "x86_64",
+        "asset": "hysteria-linux-amd64",
+        "bin_name": "hysteria",
+        "dest_dir": "run/x86_64",
+        "control_arch": "x86_64"
+      },
+      {
+        "arch": "aarch64_generic",
+        "asset": "hysteria-linux-arm64",
+        "bin_name": "hysteria",
+        "dest_dir": "run/aarch64",
+        "control_arch": "aarch64_generic"
+      }
+    ]
+  # 提交信息模板，运行时用 eval 展开。
+  COMMIT_MSG_TEMPLATE: "🔄自动构建 ${PKG_NAME}_${VERSION}-${RELEASE} | ${BUILD_TIME}(北京时间)"
+
 jobs:
-  build:
-    name: "构建并同步IPK"
+  build-ipk:
+    name: 构建 hysteria IPK 安装包
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - name: "检出代码"
-        uses: actions/checkout@v7
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: "创建临时构建目录"
+      - name: 获取上游最新版本号
         run: |
-          BUILD_DIR=$(mktemp -d)
-          echo "BUILD_DIR=${BUILD_DIR}" >> "$GITHUB_ENV"
+          echo "==> 获取上游最新版本号 开始"
+          python3 - <<'PY' || exit 1
+          import json, urllib.request, os
+          api = os.environ["UPSTREAM_API"]
+          print(f"==> 请求上游 API: {api}")
+          req = urllib.request.Request(api, headers={"User-Agent": "hysteria-ipk-builder"})
+          with urllib.request.urlopen(req) as resp:
+              releases = json.load(resp)
+          # 过滤 draft，按发布时间降序，取最新 release；包含预发布版。
+          releases = [r for r in releases if not r.get("draft")]
+          if not releases:
+              raise SystemExit("错误：上游没有可用 release")
+          releases.sort(key=lambda r: r["published_at"], reverse=True)
+          release = releases[0]
+          tag = release["tag_name"]
+          # 兼容 app/v2.6.0、v2.6.0、2.6.0 等格式。
+          version = tag.rsplit("/", 1)[-1]
+          version = version[1:] if version.startswith("v") else version
+          if not version or not version[0].isdigit():
+              raise SystemExit(f"错误：无法从 tag 解析以数字开头的版本号: {tag}")
+          print(f"==> 最新 tag: {tag}，解析版本号: {version}")
+          release_json = "/tmp/hysteria-upstream-release.json"
+          with open(release_json, "w", encoding="utf-8") as f:
+              json.dump(release, f, ensure_ascii=False)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"VERSION={version}\n")
+              f.write(f"RELEASE_JSON={release_json}\n")
+          PY
+          echo "==> 获取上游最新版本号 完成"
 
-      - name: "获取北京时间"
+      - name: 读取触发参数
         run: |
-          BEIJING_TIME=$(TZ="Asia/Shanghai" date "+%Y-%m-%d %H:%M:%S")
-          echo "BEIJING_TIME=${BEIJING_TIME}" >> "$GITHUB_ENV"
-          echo "当前北京时间: ${BEIJING_TIME}"
+          echo "==> 读取触发参数 开始"
+          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+          # 统一转为小写字符串，避免布尔值大小写差异。
+          FORCE_UPDATE=$(echo "$FORCE_UPDATE" | tr '[:upper:]' '[:lower:]')
+          echo "FORCE_UPDATE=$FORCE_UPDATE" >> "$GITHUB_ENV"
+          echo "==> 强制更新: $FORCE_UPDATE"
+          echo "==> 读取触发参数 完成"
 
-      - name: "获取最新版本号（含预发布版）"
+      - name: 版本获取
         run: |
-          VERSION_INFO=$(curl -sL \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            "https://api.github.com/repos/HyNetworks/hysteria/releases" | python3 -c '
-          import sys, json, re
-          data = json.load(sys.stdin)
-          if not isinstance(data, list) or len(data) == 0:
-              sys.exit("API返回空列表")
-          latest = data[0]
-          tag = latest.get("tag_name", "")
-          prerelease = bool(latest.get("prerelease", False))
-          # 支持多种tag格式: app/vX.Y.Z, vX.Y.Z, X.Y.Z, vX.Y.Z-beta.1 等
-          m = re.search(r"(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?)", tag)
-          if not m:
-              sys.exit("无法从tag %s 中提取版本号" % tag)
-          version = m.group(1)
-          vtype = "pre" if prerelease else "stable"
-          print("%s|%s|%s" % (version, vtype, tag))
-          ') || exit 1
-          VERSION=$(echo "${VERSION_INFO}" | cut -d'|' -f1)
-          VERSION_TYPE_FLAG=$(echo "${VERSION_INFO}" | cut -d'|' -f2)
-          ORIG_TAG=$(echo "${VERSION_INFO}" | cut -d'|' -f3)
-          if [ -z "${VERSION}" ]; then
-            echo "错误：提取版本号为空"
-            exit 1
-          fi
-          if [ "${VERSION_TYPE_FLAG}" = "pre" ]; then
-            VERSION_TYPE="预发布版"
-          else
-            VERSION_TYPE="正式版"
-          fi
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "VERSION_TYPE=${VERSION_TYPE}" >> "$GITHUB_ENV"
-          echo "ORIG_TAG=${ORIG_TAG}" >> "$GITHUB_ENV"
-          echo "上游最新版本: ${VERSION} (${VERSION_TYPE}), tag: ${ORIG_TAG}"
+          echo "==> 版本获取 开始"
+          echo "VERSION=$VERSION"
+          echo "RELEASE_JSON=$RELEASE_JSON"
+          echo "==> 版本获取 完成"
 
-      - name: "检查文件是否已存在"
-        id: check_exist
+      - name: 版本对比检查
         run: |
-          RELEASE="1"
-          X86_64_IPK="run/x86_64/hysteria-core/hysteria_${VERSION}-${RELEASE}_x86_64.ipk"
-          AARCH64_IPK="run/aarch64/hysteria-core/hysteria_${VERSION}-${RELEASE}_aarch64.ipk"
-          echo "X86_64_IPK=${X86_64_IPK}" >> "$GITHUB_ENV"
-          echo "AARCH64_IPK=${AARCH64_IPK}" >> "$GITHUB_ENV"
-          echo "预期文件:"
-          echo "  - ${X86_64_IPK}"
-          echo "  - ${AARCH64_IPK}"
-          SKIP_BUILD="false"
-          if [ "${{ inputs.force_update }}" != "true" ]; then
-            if [ -f "${X86_64_IPK}" ] && [ -f "${AARCH64_IPK}" ]; then
-              echo "两个架构IPK文件均已存在，跳过构建"
-              SKIP_BUILD="true"
-            fi
-          else
-            echo "启用强制更新模式，将重新构建"
-          fi
-          echo "SKIP_BUILD=${SKIP_BUILD}" >> "$GITHUB_ENV"
+          echo "==> 版本对比检查 开始"
+          python3 - <<'PY' || exit 1
+          import glob, json, os
+          pkg_name = os.environ["PKG_NAME"]
+          pkg_dir_name = os.environ["PKG_DIR_NAME"]
+          version = os.environ["VERSION"]
+          force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          build_archs = []
+          release_env_lines = []
+          for item in matrix:
+              arch = item["arch"]
+              target_dir = os.path.join(item["dest_dir"], pkg_dir_name)
+              pattern = os.path.join(target_dir, f"{pkg_name}_{version}-*_{arch}.ipk")
+              files = glob.glob(pattern)
+              max_release = 0
+              for f in files:
+                  base = os.path.basename(f)
+                  prefix = f"{pkg_name}_{version}-"
+                  suffix = f"_{arch}.ipk"
+                  if base.startswith(prefix) and base.endswith(suffix):
+                      mid = base[len(prefix):-len(suffix)]
+                      if mid.isdigit():
+                          max_release = max(max_release, int(mid))
+              if files and not force_update:
+                  print(f"==> 架构 {arch}: 已存在同版本文件，未强制更新，跳过")
+                  continue
+              if force_update and max_release > 0:
+                  release = max_release + 1
+                  print(f"==> 架构 {arch}: 强制更新，已有最大发行号 {max_release}，新发行号 {release}")
+              else:
+                  release = 1
+                  print(f"==> 架构 {arch}: 发行号 {release}")
+              build_archs.append(arch)
+              release_env_lines.append(f"RELEASE_{arch}={release}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("BUILD_ARCHS=" + " ".join(build_archs) + "\n")
+              for line in release_env_lines:
+                  f.write(line + "\n")
+          if build_archs:
+              print("==> 待构建架构: " + " ".join(build_archs))
+          else:
+              print("==> 无待构建架构")
+          PY
+          echo "==> 版本对比检查 完成"
 
-      - name: "下载二进制文件"
-        if: env.SKIP_BUILD != 'true'
+      - name: 下载文件 URL
         run: |
-          mkdir -p "${BUILD_DIR}/bin"
-          # URL编码原始tag中的/符号
-          TAG_ENCODED=$(echo "${ORIG_TAG}" | sed 's/\//%2F/g')
-          echo "下载 amd64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/${TAG_ENCODED}/hysteria-linux-amd64" -o "${BUILD_DIR}/bin/hysteria-amd64" || exit 1
-          echo "下载 arm64 二进制..."
-          curl -fL --retry 3 -H "User-Agent: Mozilla/5.0" "https://github.com/HyNetworks/hysteria/releases/download/${TAG_ENCODED}/hysteria-linux-arm64" -o "${BUILD_DIR}/bin/hysteria-arm64" || exit 1
-          echo "下载完成"
-          ls -lh "${BUILD_DIR}/bin/"
-
-      - name: "构建 x86_64 架构 IPK"
-        if: env.SKIP_BUILD != 'true'
-        run: |
-          RELEASE="1"
-          ARCH_BIN="amd64"
-          ARCH_PKG="x86_64"
-          ARCH_DST="x86_64"
-          IPK_NAME="hysteria_${VERSION}-${RELEASE}_${ARCH_PKG}.ipk"
-          IPK_DIR="${BUILD_DIR}/ipk-${ARCH_PKG}"
-          echo "构建 ${IPK_NAME}..."
-          mkdir -p "${IPK_DIR}/data/usr/bin"
-          mkdir -p "${IPK_DIR}/control"
-          cp "${BUILD_DIR}/bin/hysteria-${ARCH_BIN}" "${IPK_DIR}/data/usr/bin/hysteria"
-          chmod 755 "${IPK_DIR}/data/usr/bin/hysteria"
-          MAGIC=$(od -An -tx1 -N4 "${IPK_DIR}/data/usr/bin/hysteria" | tr -d ' \n')
-          echo "ELF magic: ${MAGIC}"
-          if [ "${MAGIC}" != "7f454c46" ]; then
-            echo "错误：二进制文件ELF头校验失败，文件可能损坏"
-            exit 1
+          echo "==> 下载文件 URL 开始"
+          if [ -z "$BUILD_ARCHS" ]; then
+            echo "==> 无待构建架构，跳过下载"
+            echo "==> 下载文件 URL 完成"
+            exit 0
           fi
-          echo "ELF头校验通过"
-          # 写control文件
-          printf 'Package: hysteria\nVersion: %s-%s\nSection: net\nPriority: optional\nArchitecture: %s\nDepends: libc\nInstalled-Size: %s\nMaintainer: Auto Build <auto-build@github.com>\nDescription: Hysteria is a feature-packed proxy & relay tool optimized for harsh networks.\n' "${VERSION}" "${RELEASE}" "${ARCH_PKG}" "$(du -sk "${IPK_DIR}/data" | cut -f1)" > "${IPK_DIR}/control/control"
-          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
-          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
-          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] && exit 0\nchmod 0755 /usr/bin/hysteria\nexit 0\n' > "${IPK_DIR}/control/postinst"
-          chmod 755 "${IPK_DIR}/control/postinst"
-          # 打包
-          printf '2.0\n' > "${IPK_DIR}/debian-binary"
-          ( cd "${IPK_DIR}/control" && tar -czf "${IPK_DIR}/control.tar.gz" . ) || exit 1
-          ( cd "${IPK_DIR}/data" && tar -czf "${IPK_DIR}/data.tar.gz" . ) || exit 1
-          ( cd "${IPK_DIR}" && tar -czf "${BUILD_DIR}/${IPK_NAME}" ./debian-binary ./control.tar.gz ./data.tar.gz ) || exit 1
-          # 校验
-          IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
-          echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1048576 ]; then
-            echo "错误：IPK文件过小（小于1MB），构建可能失败"
-            exit 1
-          fi
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "debian-binary" || { echo "错误：缺少debian-binary"; exit 1; }
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "control.tar.gz" || { echo "错误：缺少control.tar.gz"; exit 1; }
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "data.tar.gz" || { echo "错误：缺少data.tar.gz"; exit 1; }
-          mkdir -p "${IPK_DIR}/verify"
-          ( cd "${IPK_DIR}/verify" && tar -xzf "${BUILD_DIR}/${IPK_NAME}" && tar -xzf data.tar.gz ) || exit 1
-          if [ ! -f "${IPK_DIR}/verify/usr/bin/hysteria" ]; then
-            echo "错误：IPK内部路径验证失败，未找到usr/bin/hysteria"
-            exit 1
-          fi
-          # 模拟ImageBuilder构建环境执行postinst（设置IPKG_INSTROOT），验证脚本返回0
-          ( mkdir -p "${IPK_DIR}/verify/fake_root" && IPKG_INSTROOT="${IPK_DIR}/verify/fake_root/" sh "${IPK_DIR}/control/postinst" ) || { echo "错误：postinst在构建环境执行失败（exit $?）"; exit 1; }
-          echo "IPK格式、结构、postinst脚本校验全部通过"
-          REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
-          mkdir -p "${REPO_DIR}"
-          cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
-          echo "✅ ${IPK_NAME} 构建完成，已复制到仓库目录 ${REPO_DIR}/"
-
-      - name: "构建 aarch64 架构 IPK"
-        if: env.SKIP_BUILD != 'true'
-        run: |
-          RELEASE="1"
-          ARCH_BIN="arm64"
-          ARCH_PKG="aarch64"
-          ARCH_DST="aarch64"
-          IPK_NAME="hysteria_${VERSION}-${RELEASE}_${ARCH_PKG}.ipk"
-          IPK_DIR="${BUILD_DIR}/ipk-${ARCH_PKG}"
-          echo "构建 ${IPK_NAME}..."
-          mkdir -p "${IPK_DIR}/data/usr/bin"
-          mkdir -p "${IPK_DIR}/control"
-          cp "${BUILD_DIR}/bin/hysteria-${ARCH_BIN}" "${IPK_DIR}/data/usr/bin/hysteria"
-          chmod 755 "${IPK_DIR}/data/usr/bin/hysteria"
-          MAGIC=$(od -An -tx1 -N4 "${IPK_DIR}/data/usr/bin/hysteria" | tr -d ' \n')
-          echo "ELF magic: ${MAGIC}"
-          if [ "${MAGIC}" != "7f454c46" ]; then
-            echo "错误：二进制文件ELF头校验失败，文件可能损坏"
-            exit 1
-          fi
-          echo "ELF头校验通过"
-          # 写control文件
-          printf 'Package: hysteria\nVersion: %s-%s\nSection: net\nPriority: optional\nArchitecture: %s\nDepends: libc\nInstalled-Size: %s\nMaintainer: Auto Build <auto-build@github.com>\nDescription: Hysteria is a feature-packed proxy & relay tool optimized for harsh networks.\n' "${VERSION}" "${RELEASE}" "${ARCH_PKG}" "$(du -sk "${IPK_DIR}/data" | cut -f1)" > "${IPK_DIR}/control/control"
-          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
-          # 写postinst脚本（必须判断IPKG_INSTROOT，否则ImageBuilder构建镜像时会chmod根路径导致失败）
-          printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] && exit 0\nchmod 0755 /usr/bin/hysteria\nexit 0\n' > "${IPK_DIR}/control/postinst"
-          chmod 755 "${IPK_DIR}/control/postinst"
-          # 打包
-          printf '2.0\n' > "${IPK_DIR}/debian-binary"
-          ( cd "${IPK_DIR}/control" && tar -czf "${IPK_DIR}/control.tar.gz" . ) || exit 1
-          ( cd "${IPK_DIR}/data" && tar -czf "${IPK_DIR}/data.tar.gz" . ) || exit 1
-          ( cd "${IPK_DIR}" && tar -czf "${BUILD_DIR}/${IPK_NAME}" ./debian-binary ./control.tar.gz ./data.tar.gz ) || exit 1
-          # 校验
-          IPK_SIZE=$(stat -c%s "${BUILD_DIR}/${IPK_NAME}")
-          echo "IPK文件大小: ${IPK_SIZE} 字节"
-          if [ "${IPK_SIZE}" -lt 1048576 ]; then
-            echo "错误：IPK文件过小（小于1MB），构建可能失败"
-            exit 1
-          fi
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "debian-binary" || { echo "错误：缺少debian-binary"; exit 1; }
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "control.tar.gz" || { echo "错误：缺少control.tar.gz"; exit 1; }
-          tar -tzf "${BUILD_DIR}/${IPK_NAME}" | grep -q "data.tar.gz" || { echo "错误：缺少data.tar.gz"; exit 1; }
-          mkdir -p "${IPK_DIR}/verify"
-          ( cd "${IPK_DIR}/verify" && tar -xzf "${BUILD_DIR}/${IPK_NAME}" && tar -xzf data.tar.gz ) || exit 1
-          if [ ! -f "${IPK_DIR}/verify/usr/bin/hysteria" ]; then
-            echo "错误：IPK内部路径验证失败，未找到usr/bin/hysteria"
-            exit 1
-          fi
-          # 模拟ImageBuilder构建环境执行postinst（设置IPKG_INSTROOT），验证脚本返回0
-          ( mkdir -p "${IPK_DIR}/verify/fake_root" && IPKG_INSTROOT="${IPK_DIR}/verify/fake_root/" sh "${IPK_DIR}/control/postinst" ) || { echo "错误：postinst在构建环境执行失败（exit $?）"; exit 1; }
-          echo "IPK格式、结构、postinst脚本校验全部通过"
-          REPO_DIR="${GITHUB_WORKSPACE}/run/${ARCH_DST}/hysteria-core"
-          mkdir -p "${REPO_DIR}"
-          cp "${BUILD_DIR}/${IPK_NAME}" "${REPO_DIR}/"
-          echo "✅ ${IPK_NAME} 构建完成，已复制到仓库目录 ${REPO_DIR}/"
-
-      - name: "清理本工作流相关旧版本文件"
-        if: env.SKIP_BUILD != 'true'
-        run: |
-          echo "开始清理旧版本IPK文件..."
-          KEEP_X86=$(basename "${X86_64_IPK}")
-          KEEP_AARCH64=$(basename "${AARCH64_IPK}")
-          for DIR in "run/x86_64/hysteria-core" "run/aarch64/hysteria-core"; do
-            if [ -d "${DIR}" ]; then
-              for f in "${DIR}"/*.ipk; do
-                [ -f "$f" ] || continue
-                fname=$(basename "$f")
-                # 精确匹配 hysteria_版本号-发布号_架构.ipk 格式（无v前缀）
-                if echo "${fname}" | grep -qE '^hysteria_[0-9]+\.[0-9]+\.[0-9]+-[0-9]+_(x86_64|aarch64)\.ipk$'; then
-                  if [ "${fname}" != "${KEEP_X86}" ] && [ "${fname}" != "${KEEP_AARCH64}" ]; then
-                    echo "删除旧版本: $f"
-                    rm -f "$f"
-                  fi
-                fi
-              done
-            fi
+          mkdir -p /tmp/hysteria-build || exit 1
+          for ARCH in $BUILD_ARCHS; do
+            echo "==> 处理架构: $ARCH"
+            info=$(python3 - "$ARCH" <<'PY'
+          import json, os, sys
+          arch = sys.argv[1]
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          item = next((x for x in matrix if x["arch"] == arch), None)
+          if not item:
+              sys.exit(f"错误：ARCH_MATRIX 中未找到架构 {arch}")
+          with open(os.environ["RELEASE_JSON"], encoding="utf-8") as f:
+              release = json.load(f)
+          asset = item["asset"]
+          url = None
+          for a in release.get("assets", []):
+              if a.get("name") == asset:
+                  url = a.get("browser_download_url")
+                  break
+          if not url:
+              sys.exit(f"错误：未找到资产 {asset} 的下载 URL")
+          print(f"{url}|{item['asset']}|{item['bin_name']}|{item['dest_dir']}|{item['control_arch']}")
+          PY
+          ) || exit 1
+            IFS='|' read -r URL ASSET BIN_NAME DEST_DIR CONTROL_ARCH <<< "$info"
+            echo "==> 下载 URL: $URL"
+            echo "==> 资产: $ASSET，二进制名: $BIN_NAME，目录: $DEST_DIR，control 架构: $CONTROL_ARCH"
+            mkdir -p "/tmp/hysteria-build/$ARCH" || exit 1
+            curl -L -H "User-Agent: hysteria-ipk-builder" -o "/tmp/hysteria-build/$ARCH/$BIN_NAME" "$URL" || { echo "错误：下载失败 $URL" >&2; exit 1; }
+            echo "==> 保存路径: /tmp/hysteria-build/$ARCH/$BIN_NAME"
+            ls -lh "/tmp/hysteria-build/$ARCH/$BIN_NAME"
           done
-          echo "旧版本清理完成"
+          echo "==> 下载文件 URL 完成"
 
-      - name: "提交并推送到仓库"
-        if: env.SKIP_BUILD != 'true'
+      - name: 构建 IPK 安装包并更名
         run: |
+          echo "==> 构建 IPK 安装包并更名 开始"
+          if [ -z "$BUILD_ARCHS" ]; then
+            echo "==> 无待构建架构，跳过构建"
+            echo "==> 构建 IPK 安装包并更名 完成"
+            exit 0
+          fi
+          for ARCH in $BUILD_ARCHS; do
+            echo "==> 构建 $ARCH 的 IPK"
+            release_var="RELEASE_${ARCH}"
+            RELEASE="${!release_var}"
+            if [ -z "$RELEASE" ]; then
+              echo "错误：未找到 $ARCH 的发行号" >&2
+              exit 1
+            fi
+            info=$(python3 - "$ARCH" <<'PY'
+          import json, os, sys
+          arch = sys.argv[1]
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          item = next((x for x in matrix if x["arch"] == arch), None)
+          if not item:
+              sys.exit(f"错误：ARCH_MATRIX 中未找到架构 {arch}")
+          print(f"{item['bin_name']}|{item['dest_dir']}|{item['control_arch']}")
+          PY
+          ) || exit 1
+            IFS='|' read -r BIN_NAME DEST_DIR CONTROL_ARCH <<< "$info"
+            echo "==> 架构: $ARCH，二进制名: $BIN_NAME，目标目录: $DEST_DIR，control 架构: $CONTROL_ARCH"
+            bin="/tmp/hysteria-build/$ARCH/$BIN_NAME"
+            [ -f "$bin" ] || { echo "错误：二进制文件不存在: $bin" >&2; exit 1; }
+            magic=$(od -An -tx1 -N4 "$bin" | tr -d ' \n')
+            echo "==> ELF 头: $magic"
+            [ "$magic" = "7f454c46" ] || { echo "错误：ELF 头校验失败" >&2; exit 1; }
+            TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) || exit 1
+            BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S') || exit 1
+            echo "==> TIMESTAMP: $TIMESTAMP，BUILD_TIME: $BUILD_TIME"
+            work_dir="/tmp/hysteria-build/$ARCH/work"
+            stage_dir="$work_dir/stage"
+            rm -rf "$work_dir" || exit 1
+            mkdir -p "$stage_dir/data/usr/bin" "$stage_dir/control" || exit 1
+            cp "$bin" "$stage_dir/data/usr/bin/$BIN_NAME" || exit 1
+            chmod 755 "$stage_dir/data/usr/bin/$BIN_NAME" || true
+            INSTALLED_SIZE=$(du -k -s "$stage_dir/data/usr/bin/$BIN_NAME" | awk '{print $1}') || exit 1
+            echo "==> INSTALLED_SIZE: ${INSTALLED_SIZE} KB"
+            cat > "$stage_dir/control/control" <<EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}-${RELEASE}
+          Depends: libc
+          Source: https://github.com/HyNetworks/hysteria
+          SourceName: ${PKG_NAME}
+          License: MIT
+          Section: net
+          Priority: optional
+          Architecture: ${CONTROL_ARCH}
+          Installed-Size: ${INSTALLED_SIZE}
+          Maintainer: OpenWrt <openwrt@example.com>
+          Description: Hysteria is a feature-packed proxy relay powered by QUIC.
+          EOF
+            cat > "$stage_dir/control/postinst" <<'EOF'
+          #!/bin/sh
+          [ -n "$IPKG_INSTROOT" ] && exit 0
+          chmod 755 /usr/bin/hysteria || true
+          exit 0
+          EOF
+            chmod 755 "$stage_dir/control/postinst" || exit 1
+            printf '2.0\n' > "$stage_dir/debian-binary" || exit 1
+            (cd "$stage_dir/data" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf "$stage_dir/data.tar.gz" .) || { echo "错误：data.tar.gz 打包失败" >&2; exit 1; }
+            (cd "$stage_dir/control" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf "$stage_dir/control.tar.gz" .) || { echo "错误：control.tar.gz 打包失败" >&2; exit 1; }
+            PKG_FILE="${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk"
+            echo "==> PKG_FILE: $PKG_FILE"
+            (cd "$stage_dir" && tar --format=gnu --numeric-owner --owner=0 --group=0 --sort=name --mtime="$TIMESTAMP" -I 'gzip -n' -cf "$PKG_FILE" ./debian-binary ./data.tar.gz ./control.tar.gz) || { echo "错误：IPK 外层打包失败" >&2; exit 1; }
+            dest_dir="${DEST_DIR}/${PKG_DIR_NAME}"
+            mkdir -p "$dest_dir" || exit 1
+            mv "$stage_dir/$PKG_FILE" "$dest_dir/$PKG_FILE" || exit 1
+            echo "==> 生成文件: $dest_dir/$PKG_FILE"
+          done
+          echo "==> 构建 IPK 安装包并更名 完成"
+
+      - name: IPK 完整性校验
+        run: |
+          echo "==> IPK 完整性校验 开始"
+          if [ -z "$BUILD_ARCHS" ]; then
+            echo "==> 无待构建架构，跳过校验"
+            echo "==> IPK 完整性校验 完成"
+            exit 0
+          fi
+          for ARCH in $BUILD_ARCHS; do
+            echo "==> 校验 $ARCH 的 IPK"
+            release_var="RELEASE_${ARCH}"
+            RELEASE="${!release_var}"
+            info=$(python3 - "$ARCH" <<'PY'
+          import json, os, sys
+          arch = sys.argv[1]
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          item = next((x for x in matrix if x["arch"] == arch), None)
+          if not item:
+              sys.exit(f"错误：ARCH_MATRIX 中未找到架构 {arch}")
+          print(item["dest_dir"])
+          PY
+          ) || exit 1
+            DEST_DIR="$info"
+            pkg_path="${DEST_DIR}/${PKG_DIR_NAME}/${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk"
+            [ -f "$pkg_path" ] || { echo "错误：IPK 文件不存在: $pkg_path" >&2; exit 1; }
+            echo "==> 校验文件: $pkg_path"
+            mapfile -t members < <(tar -tzf "$pkg_path" | head -n 3)
+            echo "==> 外层成员: ${members[*]}"
+            if [ "${#members[@]}" -ne 3 ] || [ "${members[0]}" != "./debian-binary" ] || [ "${members[1]}" != "./data.tar.gz" ] || [ "${members[2]}" != "./control.tar.gz" ]; then
+              echo "错误：IPK 外层成员顺序错误" >&2
+              exit 1
+            fi
+            rm -rf /tmp/ipk-test || exit 1
+            mkdir -p /tmp/ipk-test || exit 1
+            tar -xzf "$pkg_path" -C /tmp/ipk-test || { echo "错误：解压 IPK 失败" >&2; exit 1; }
+            mkdir -p /tmp/ipk-test/control || exit 1
+            tar -xzf /tmp/ipk-test/control.tar.gz -C /tmp/ipk-test/control || { echo "错误：解压 control.tar.gz 失败" >&2; exit 1; }
+            if IPKG_INSTROOT=/tmp/ipk-test sh /tmp/ipk-test/control/postinst; then
+              postinst_rc=0
+            else
+              postinst_rc=$?
+            fi
+            echo "==> postinst 返回码: $postinst_rc"
+            [ "$postinst_rc" -eq 0 ] || { echo "错误：postinst 执行失败" >&2; exit 1; }
+            rm -rf /tmp/ipk-test/data || exit 1
+            mkdir -p /tmp/ipk-test/data || exit 1
+            tar -xzf /tmp/ipk-test/data.tar.gz -C /tmp/ipk-test/data || { echo "错误：解压 data.tar.gz 失败" >&2; exit 1; }
+            bin="/tmp/ipk-test/data/usr/bin/hysteria"
+            [ -f "$bin" ] || { echo "错误：未找到 /usr/bin/hysteria" >&2; exit 1; }
+            magic=$(od -An -tx1 -N4 "$bin" | tr -d ' \n')
+            echo "==> data.tar.gz 中 ELF 头: $magic"
+            [ "$magic" = "7f454c46" ] || { echo "错误：data.tar.gz 中 ELF 头校验失败" >&2; exit 1; }
+          done
+          echo "==> IPK 完整性校验 完成"
+
+      - name: 清理旧版本文件
+        run: |
+          echo "==> 清理旧版本文件 开始"
+          if [ -z "$BUILD_ARCHS" ]; then
+            echo "==> 无待构建架构，跳过清理"
+            echo "==> 清理旧版本文件 完成"
+            exit 0
+          fi
+          for ARCH in $BUILD_ARCHS; do
+            release_var="RELEASE_${ARCH}"
+            RELEASE="${!release_var}"
+            info=$(python3 - "$ARCH" <<'PY'
+          import json, os, sys
+          arch = sys.argv[1]
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          item = next((x for x in matrix if x["arch"] == arch), None)
+          if not item:
+              sys.exit(f"错误：ARCH_MATRIX 中未找到架构 {arch}")
+          print(item["dest_dir"])
+          PY
+          ) || exit 1
+            dest_dir="${info}/${PKG_DIR_NAME}"
+            [ -d "$dest_dir" ] || continue
+            echo "==> 清理目录: $dest_dir，保留: ${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk"
+            for f in "$dest_dir"/*.ipk; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+                "${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk")
+                  ;;
+                "${PKG_NAME}_"*"_${ARCH}.ipk")
+                  echo "==> 删除旧文件: $f"
+                  rm -f "$f" || exit 1
+                  ;;
+                *)
+                  ;;
+              esac
+            done
+          done
+          echo "==> 清理旧版本文件 完成"
+
+      - name: 提交并推送
+        run: |
+          echo "==> 提交并推送 开始"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "run/x86_64/hysteria-core/*.ipk" "run/aarch64/hysteria-core/*.ipk"
-          COMMIT_MSG="🔄自动构建 Hysteria ${VERSION_TYPE} v${VERSION} | ${BEIJING_TIME}(北京时间)"
-          echo "提交信息: ${COMMIT_MSG}"
-          git commit -m "${COMMIT_MSG}" || echo "无变更需要提交"
-          git push
-          echo "✅ 推送完成"
-
-      - name: "清理临时文件（无论成功失败）"
-        if: always()
-        run: |
-          echo "清理临时构建目录..."
-          if [ -n "${BUILD_DIR}" ] && [ -d "${BUILD_DIR}" ]; then
-            rm -rf "${BUILD_DIR}"
-            echo "临时目录已清理: ${BUILD_DIR}"
+          if [ -n "$BUILD_ARCHS" ]; then
+            first_arch=$(echo "$BUILD_ARCHS" | awk '{print $1}')
+            release_var="RELEASE_${first_arch}"
+            RELEASE="${!release_var}"
+          else
+            RELEASE="0"
           fi
-          echo "清理完成"
+          BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S') || exit 1
+          eval "COMMIT_MSG=\"$COMMIT_MSG_TEMPLATE\""
+          echo "==> 提交信息: $COMMIT_MSG"
+          if [ -d run ]; then
+            git add run/ || exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "==> 无变更，跳过提交"
+          else
+            git commit -m "$COMMIT_MSG" || exit 1
+            git push || exit 1
+            echo "==> 推送完成"
+          fi
+          echo "==> 提交并推送 完成"
+
+      - name: 结果总结
+        run: |
+          echo "==> 结果总结 开始"
+          {
+            echo "## 自动构建 hysteria IPK 安装包结果"
+            echo ""
+            if [ -z "$BUILD_ARCHS" ]; then
+              echo "本次无待构建架构。"
+            else
+              echo "| 版本 | 发行号 | 架构 | 文件路径 |"
+              echo "| --- | --- | --- | --- |"
+              for ARCH in $BUILD_ARCHS; do
+                release_var="RELEASE_${ARCH}"
+                RELEASE="${!release_var}"
+                info=$(python3 - "$ARCH" <<'PY'
+          import json, os, sys
+          arch = sys.argv[1]
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          item = next((x for x in matrix if x["arch"] == arch), None)
+          if not item:
+              sys.exit(f"错误：ARCH_MATRIX 中未找到架构 {arch}")
+          print(item["dest_dir"])
+          PY
+          ) || exit 1
+                pkg_path="${info}/${PKG_DIR_NAME}/${PKG_NAME}_${VERSION}-${RELEASE}_${ARCH}.ipk"
+                echo "| ${VERSION} | ${RELEASE} | ${ARCH} | ${pkg_path} |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "==> 结果总结 完成"
+
+      - name: 清理缓存和临时文件
+        run: |
+          echo "==> 清理缓存和临时文件 开始"
+          rm -rf /tmp/hysteria-build /tmp/ipk-test /tmp/hysteria-upstream-release.json || true
+          echo "==> 已清理: /tmp/hysteria-build /tmp/ipk-test /tmp/hysteria-upstream-release.json"
+          echo "==> 清理缓存和临时文件 完成"
