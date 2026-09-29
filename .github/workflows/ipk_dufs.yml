@@ -1,287 +1,474 @@
-# ============================================================
-# OpenWrt dufs 软件包同步工作流
-# 功能：从 mirrors.vsean.net 自动下载 dufs 及其 LuCI 插件，
-#       按文件名对比版本、清理旧版本、推送到当前仓库。
-# 架构：aarch64_generic、x86_64
-# 包名：dufs、luci-app-dufs、luci-i18n-dufs-zh-cn
-# ============================================================
-
+# ============================================================================
+# 工作流名称：自动更新 dufs IPK 软件包
+# 功能说明：从上游镜像源下载已有的 dufs / luci-app-dufs / luci-i18n-dufs-zh-cn
+#           IPK 文件（不重新构建），按架构归档到 run/<arch>/luci-app-dufs/ 目录，
+#           存在版本变化时自动提交并推送回仓库。
+# 触发方式：定时触发（每天 UTC 22:23 / 北京时间次日 06:23）+ 手动触发
+# ============================================================================
 name: 自动更新 dufs IPK 软件包
 
-"on":
+on:
+  # 定时触发：每天 UTC 22:23（北京时间次日 06:23）
   schedule:
-    - cron: '23 22 * * *'	# 每天定时自动运行（北京时间 06:23 对应 UTC 22:23）
-  workflow_dispatch:		# 支持手动触发
+    - cron: '23 22 * * *'
+  # 手动触发：提供强制更新开关
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '强制更新：为 true 时忽略版本比较，重新下载并提交'
+        required: false
+        type: boolean
+        default: false
 
-concurrency:	# 防止定时任务与手动触发并发执行导致提交冲突
-  group: argon-repo-build
+# 并发控制：同一工作流 + 同一 ref 不并发，且不取消进行中的任务
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# 仓库权限：需要写入权限用于提交并推送
 permissions:
-  contents: write   # 允许推送到本仓库
-  actions: write    # 允许清理本仓库的 Actions 运行缓存
+  contents: write
+
+# ============================================================================
+# 全局固定配置（不随每次运行变化的常量）
+# 运行时变量由各步骤通过 $GITHUB_ENV 传递
+# ============================================================================
+env:
+  # 上游镜像源根地址
+  MIRROR_BASE: https://mirrors.vsean.net/openwrt/releases/24.10.6/packages
+  # 时区：Asia/Shanghai，保证 date 输出北京时间
+  TZ: Asia/Shanghai
+  # 架构矩阵：arch 为架构标识；packages_path 为架构相关包目录；
+  #           luci_path 为全架构（luci）包目录；dest_dir 为仓库提交目录
+  ARCH_MATRIX: |
+    [
+      {
+        "arch": "x86_64",
+        "packages_path": "x86_64/packages",
+        "luci_path": "x86_64/luci",
+        "dest_dir": "run/x86_64/luci-app-dufs"
+      },
+      {
+        "arch": "aarch64_generic",
+        "packages_path": "aarch64_generic/packages",
+        "luci_path": "x86_64/luci",
+        "dest_dir": "run/aarch64/luci-app-dufs"
+      }
+    ]
+  # 软件包清单：name 为包名；pattern 为文件名前缀；type 为包类型
+  #   arch_specific —— 架构相关包，文件名形如 <pattern><版本>_<架构>.ipk
+  #   all           —— 全架构包，文件名形如 <pattern><版本>_all.ipk
+  PACKAGE_NAMES: |
+    [
+      {"name": "dufs", "pattern": "dufs_", "type": "arch_specific"},
+      {"name": "luci-app-dufs", "pattern": "luci-app-dufs_", "type": "all"},
+      {"name": "luci-i18n-dufs-zh-cn", "pattern": "luci-i18n-dufs-zh-cn_", "type": "all"}
+    ]
+  # 提交信息模板：运行时替换 ${PKG_NAME}、${VERSION}、${BUILD_TIME}
+  COMMIT_MSG_TEMPLATE: "🔄自动更新 ${PKG_NAME} ${VERSION} | ${BUILD_TIME}(北京时间)"
 
 jobs:
-  sync-dufs-packages:
-    name: 同步dufs软件包
+  # 单一 job，内部通过 shell 循环遍历架构矩阵与软件包清单
+  update-ipk:
+    name: 自动更新 dufs IPK 软件包
     runs-on: ubuntu-latest
 
-    env:
-      OPENWRT_VERSION: '24.10.6'
-      MIRROR_BASE: 'https://mirrors.vsean.net/openwrt/releases/24.10.6/packages'
-      TZ: Asia/Shanghai
-
     steps:
-      # --------------------------------------------------------
-      # 第1步：检出仓库（固定工作目录，防止目录漂移）
-      # --------------------------------------------------------
+      # ----------------------------------------------------------------------
+      # 步骤 1：检出仓库代码
+      # ----------------------------------------------------------------------
       - name: 检出仓库代码
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0	# 需要完整历史以对比版本
+          fetch-depth: 0
 
-      # --------------------------------------------------------
-      # 第2步：初始化工作环境
-      # --------------------------------------------------------
-      - name: 初始化工作环境
-        id: init
+      # ----------------------------------------------------------------------
+      # 步骤 2：读取触发参数
+      # 把 workflow_dispatch 的 force_update 统一为字符串，写入 GITHUB_ENV
+      # ----------------------------------------------------------------------
+      - name: 读取触发参数
+        env:
+          FORCE_UPDATE_INPUT: ${{ github.event.inputs.force_update || 'false' }}
         run: |
-          set -euo pipefail
-          echo "WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-          mkdir -p "$GITHUB_WORKSPACE/run/x86_64/luci-app-dufs"
-          mkdir -p "$GITHUB_WORKSPACE/run/aarch64/luci-app-dufs"
-          echo "工作目录初始化完成：$GITHUB_WORKSPACE"
+          echo "==> 读取触发参数 开始"
+          # 定时触发时该值为空，统一回退为 false
+          FORCE_UPDATE="${FORCE_UPDATE_INPUT:-false}"
+          echo "FORCE_UPDATE=${FORCE_UPDATE}" >> "$GITHUB_ENV"
+          echo "==> 强制更新: ${FORCE_UPDATE}"
+          echo "当前分支: ${{ github.ref }}"
+          echo "==> 读取触发参数 完成"
 
-      # --------------------------------------------------------
-      # 第3步：下载并同步各架构软件包
-      # --------------------------------------------------------
-      - name: 下载并同步dufs软件包
-        id: download
+      # ----------------------------------------------------------------------
+      # 步骤 3：获取上游最新版本
+      # 请求镜像目录 HTML，解析 ipk 文件名并提取版本号，结果写入 upstream.json
+      # 注意：heredoc 内所有 Python 代码必须保持与 python3 命令相同的缩进，
+      #       YAML 会去掉公共缩进后再交给 Python 执行。
+      # ----------------------------------------------------------------------
+      - name: 获取上游最新版本
         run: |
-          set -euo pipefail
-          cd "$WORKDIR"
+          echo "==> 获取上游最新版本 开始"
+          python3 - <<'PY'
+          import os
+          import re
+          import json
+          import pathlib
+          import urllib.request
 
-          UPDATED_PKGS_FILE="/tmp/updated_pkgs.txt"
-          UPDATED_ARCHS_FILE="/tmp/updated_archs.txt"
-          : > "$UPDATED_PKGS_FILE"
-          : > "$UPDATED_ARCHS_FILE"
-          CHANGED=0
+          # ===== 读取环境变量中的固定配置 =====
+          mirror_base = os.environ["MIRROR_BASE"]
+          arch_matrix = json.loads(os.environ["ARCH_MATRIX"])
+          package_names = json.loads(os.environ["PACKAGE_NAMES"])
 
-          # 定义要处理的架构: "源架构名|目标相对目录"
-          ARCH_MAPPINGS=(
-            "aarch64_generic|run/aarch64/luci-app-dufs"
-            "x86_64|run/x86_64/luci-app-dufs"
-          )
+          USER_AGENT = "dufs-ipk-updater"
+          work_dir = pathlib.Path("/tmp/dufs-build")
+          work_dir.mkdir(parents=True, exist_ok=True)
 
-          for MAPPING in "${ARCH_MAPPINGS[@]}"; do
-            SRC_ARCH="${MAPPING%%|*}"
-            DEST_REL="${MAPPING#*|}"
-            DEST_DIR="$WORKDIR/$DEST_REL"
+          # 目录内容缓存：同一目录（例如两个架构共用 x86_64/luci）只请求一次
+          html_cache = {}
 
-            echo "=========================================="
-            echo "处理架构: $SRC_ARCH -> $DEST_REL"
-            echo "=========================================="
-            mkdir -p "$DEST_DIR"
 
-            PKG_BASE_URL="$MIRROR_BASE/$SRC_ARCH"
+          def fetch_ipk_files(url):
+              """请求镜像目录页面，返回该目录下所有 ipk 文件名列表"""
+              if url in html_cache:
+                  print(f"==> 使用缓存目录内容: {url}")
+                  return html_cache[url]
 
-            # 格式: "子目录|远端包名前缀|本地文件清理前缀"
-            PKG_LIST=(
-              "packages|dufs_|dufs_"
-              "luci|luci-app-dufs_|luci-app-dufs_"
-              "luci|luci-i18n-dufs-zh-cn_|luci-i18n-dufs-zh-cn_"
-            )
+              print(f"==> 请求镜像目录: {url}")
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      html = resp.read().decode("utf-8", errors="ignore")
+              except Exception as exc:
+                  print(f"错误：请求镜像目录失败 {url} -> {exc}")
+                  raise
 
-            for ENTRY in "${PKG_LIST[@]}"; do
-              SUB_DIR="${ENTRY%%|*}"
-              REST="${ENTRY#*|}"
-              REMOTE_PREFIX="${REST%%|*}"
-              CLEAN_PREFIX="${REST#*|}"
+              # 提取 href 指向的 ipk 文件名（去掉可能存在的路径前缀）
+              files = [item.split("/")[-1] for item in re.findall(r'href="([^"]+\.ipk)"', html)]
+              html_cache[url] = files
 
-              echo ""
-              echo "--- 处理包: $REMOTE_PREFIX (来源: $SUB_DIR) ---"
+              print(f"==> 目录 {url} 中找到 {len(files)} 个 ipk 文件")
+              for name in files:
+                  print(f"    - {name}")
+              return files
 
-              INDEX_URL="$PKG_BASE_URL/$SUB_DIR/"
 
-              # 从索引页抓取最新 .ipk 文件名（最多重试3次）
-              REMOTE_NAME=""
-              for RETRY in 1 2 3; do
-                REMOTE_NAME=$(wget -qO- "$INDEX_URL" \
-                  | grep -oE 'href="'${REMOTE_PREFIX}'[^"]*[.]ipk"' \
-                  | head -n1 \
-                  | sed -E 's/href="([^"]+)"/\1/')
-                if [ -n "$REMOTE_NAME" ]; then
-                  break
-                fi
-                echo "  第${RETRY}次抓取失败，等待后重试..."
-                sleep 2
-              done
+          def parse_version(filename, pkg_name):
+              """从 ipk 文件名解析版本号，例如 dufs_0.43.0-r1_x86_64.ipk -> 0.43.0-r1"""
+              stem = filename[:-4] if filename.endswith(".ipk") else filename
+              prefix = pkg_name + "_"
+              if not stem.startswith(prefix):
+                  return None
+              rest = stem[len(prefix):]
+              idx = rest.rfind("_")
+              if idx <= 0:
+                  return None
+              return rest[:idx]
 
-              if [ -z "$REMOTE_NAME" ]; then
-                echo "::warning::未找到 $REMOTE_PREFIX 开头的 .ipk 文件（索引: $INDEX_URL）"
-                continue
-              fi
 
-              echo "远端最新版本: $REMOTE_NAME"
-              TARGET_PATH="$DEST_DIR/$REMOTE_NAME"
+          def version_key(version):
+              """把版本号转换成可比较的数字列表，用于排序取最新"""
+              return [int(part) for part in re.findall(r"\d+", version or "")]
 
-              # ---------- 清理旧版本（无论是否需要下载，都清理同前缀的旧版 .ipk） ----------
-              OLD_FILES=$(find "$DEST_DIR" -maxdepth 1 -type f \
-                -name "${CLEAN_PREFIX}*.ipk" \
-                ! -name "$REMOTE_NAME" 2>/dev/null || true)
-              if [ -n "$OLD_FILES" ]; then
-                echo "清理该包的旧版本文件:"
-                echo "$OLD_FILES" | sed 's/^/  删除: /'
-                echo "$OLD_FILES" | xargs rm -f
-                CHANGED=1
-              fi
 
-              # ---------- 版本对比（仅按文件名，不比较文件内容） ----------
-              if [ -f "$TARGET_PATH" ]; then
-                echo "本地已是最新版本，跳过下载"
-                continue
-              fi
+          upstream = []
 
-              # ---------- 下载新版本（重试3次） ----------
-              DL_URL="$PKG_BASE_URL/$SUB_DIR/$REMOTE_NAME"
-              echo "下载: $DL_URL"
-              DL_OK=0
-              for RETRY in 1 2 3; do
-                if wget -q --show-progress -O "$TARGET_PATH" "$DL_URL" && [ -s "$TARGET_PATH" ]; then
-                  DL_OK=1
-                  break
-                fi
-                echo "  第${RETRY}次下载失败，重试..."
-                sleep 2
-                rm -f "$TARGET_PATH"
-              done
+          for entry in arch_matrix:
+              arch = entry["arch"]
+              dest_dir = entry["dest_dir"]
 
-              if [ $DL_OK -eq 1 ]; then
-                FILE_SIZE=$(du -h "$TARGET_PATH" | cut -f1)
-                echo "下载成功 ($FILE_SIZE)"
-                echo "$REMOTE_NAME" >> "$UPDATED_PKGS_FILE"
-                # 避免重复记录架构
-                if ! grep -qxF "$SRC_ARCH" "$UPDATED_ARCHS_FILE" 2>/dev/null; then
-                  echo "$SRC_ARCH" >> "$UPDATED_ARCHS_FILE"
-                fi
-                CHANGED=1
-              else
-                echo "::error::下载失败: $REMOTE_NAME"
-                rm -f "$TARGET_PATH"
-              fi
+              for pkg in package_names:
+                  pkg_name = pkg["name"]
+                  pattern = pkg["pattern"]
+                  pkg_type = pkg["type"]
+
+                  if pkg_type == "arch_specific":
+                      # 架构相关包：目录取 packages_path，文件名以 _{arch}.ipk 结尾
+                      dir_url = f"{mirror_base}/{entry['packages_path']}/"
+                      suffix = f"_{arch}.ipk"
+                  else:
+                      # 全架构包：目录取 luci_path，文件名以 _all.ipk 结尾
+                      dir_url = f"{mirror_base}/{entry['luci_path']}/"
+                      suffix = "_all.ipk"
+
+                  files = fetch_ipk_files(dir_url)
+                  candidates = [f for f in files if f.startswith(pattern) and f.endswith(suffix)]
+
+                  print(f"==> 架构 {arch} / 软件包 {pkg_name} 匹配到 {len(candidates)} 个候选文件")
+                  for name in candidates:
+                      print(f"    - {name}")
+
+                  if not candidates:
+                      print(f"错误：架构 {arch} 的软件包 {pkg_name} 在 {dir_url} 中未找到匹配文件")
+                      raise SystemExit(1)
+
+                  # 按版本号降序排序，取最新
+                  candidates.sort(key=lambda f: version_key(parse_version(f, pkg_name)), reverse=True)
+                  latest_file = candidates[0]
+                  version = parse_version(latest_file, pkg_name)
+
+                  item = {
+                      "arch": arch,
+                      "pkg": pkg_name,
+                      "pattern": pattern,
+                      "dest_dir": dest_dir,
+                      "file": latest_file,
+                      "version": version,
+                      "url": f"{dir_url}{latest_file}",
+                  }
+                  upstream.append(item)
+                  print(f"==> 架构 {arch} / 软件包 {pkg_name} 最新版本: {version}（文件: {latest_file}）")
+
+          result_path = work_dir / "upstream.json"
+          result_path.write_text(json.dumps(upstream, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"==> 上游版本信息已写入 {result_path}")
+          PY
+          echo "==> 获取上游最新版本 完成"
+
+      # ----------------------------------------------------------------------
+      # 步骤 4：版本对比检查
+      # 对比目标目录已有文件，生成待下载清单 plan.json，并导出 HAS_UPDATE
+      # ----------------------------------------------------------------------
+      - name: 版本对比检查
+        run: |
+          echo "==> 版本对比检查 开始"
+          python3 - <<'PY'
+          import os
+          import json
+          import pathlib
+
+          work_dir = pathlib.Path("/tmp/dufs-build")
+          upstream = json.loads((work_dir / "upstream.json").read_text(encoding="utf-8"))
+          force_update = os.environ.get("FORCE_UPDATE", "false").strip().lower() == "true"
+
+          print(f"==> 强制更新开关: {force_update}")
+
+          plan = []
+          skipped = []
+
+          for item in upstream:
+              dest = pathlib.Path(item["dest_dir"])
+              existing = []
+              if dest.is_dir():
+                  existing = sorted(
+                      p.name for p in dest.iterdir()
+                      if p.is_file() and p.name.startswith(item["pattern"]) and p.name.endswith(".ipk")
+                  )
+
+              already_same = item["file"] in existing
+
+              print(f"==> 检查 架构 {item['arch']} / 软件包 {item['pkg']}")
+              print(f"    最新文件: {item['file']}")
+              print(f"    目标目录: {item['dest_dir']}")
+              print(f"    现有文件: {existing if existing else '无'}")
+
+              if already_same and not force_update:
+                  print(f"==> 跳过 架构 {item['arch']} / 软件包 {item['pkg']}：目标目录已存在相同版本")
+                  skipped.append(item)
+                  continue
+
+              if already_same and force_update:
+                  print(f"==> 强制更新 架构 {item['arch']} / 软件包 {item['pkg']}：忽略版本比较")
+              else:
+                  print(f"==> 需要更新 架构 {item['arch']} / 软件包 {item['pkg']}")
+
+              plan.append(item)
+
+          plan_path = work_dir / "plan.json"
+          plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"==> 待下载文件数: {len(plan)}，跳过数: {len(skipped)}")
+
+          # 将是否有更新写入 GITHUB_ENV，供后续步骤的 if 条件使用
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a", encoding="utf-8") as fp:
+                  fp.write(f"HAS_UPDATE={'true' if plan else 'false'}\n")
+              print(f"==> 已导出 HAS_UPDATE={'true' if plan else 'false'}")
+          PY
+          echo "==> 版本对比检查 完成"
+
+      # ----------------------------------------------------------------------
+      # 步骤 5：下载 IPK 文件
+      # 从上游镜像源下载到 /tmp/dufs-build/<arch>/，不做任何格式转换
+      # ----------------------------------------------------------------------
+      - name: 下载 IPK 文件
+        if: env.HAS_UPDATE == 'true'
+        run: |
+          echo "==> 下载 IPK 文件 开始"
+          PLAN_FILE=/tmp/dufs-build/plan.json
+          TOTAL=$(jq 'length' "$PLAN_FILE")
+          echo "==> 待下载文件总数: ${TOTAL}"
+          INDEX=0
+
+          while IFS= read -r ITEM; do
+            INDEX=$((INDEX + 1))
+            ARCH=$(printf '%s' "$ITEM" | jq -r '.arch')
+            PKG_NAME=$(printf '%s' "$ITEM" | jq -r '.pkg')
+            VERSION=$(printf '%s' "$ITEM" | jq -r '.version')
+            PKG_FILE=$(printf '%s' "$ITEM" | jq -r '.file')
+            SOURCE_URL=$(printf '%s' "$ITEM" | jq -r '.url')
+            SAVE_PATH="/tmp/dufs-build/${ARCH}/${PKG_FILE}"
+
+            mkdir -p "$(dirname "$SAVE_PATH")" || exit 1
+
+            echo "==> [${INDEX}/${TOTAL}] 软件包 ${PKG_NAME} | 架构 ${ARCH} | 版本 ${VERSION}"
+            echo "==> 下载地址: ${SOURCE_URL}"
+            echo "==> 保存路径: ${SAVE_PATH}"
+
+            curl -L --fail --retry 3 --retry-delay 5 \
+              -H "User-Agent: dufs-ipk-updater" \
+              -o "$SAVE_PATH" "$SOURCE_URL" \
+              || { echo "错误：下载失败 ${SOURCE_URL}" >&2; exit 1; }
+
+            FILE_SIZE=$(du -h "$SAVE_PATH" | cut -f1)
+            echo "==> 文件大小: ${FILE_SIZE}"
+          done < <(jq -c '.[]' "$PLAN_FILE")
+
+          echo "==> 下载 IPK 文件 完成"
+
+      # ----------------------------------------------------------------------
+      # 步骤 6：提交文件至仓库
+      # 复制到目标目录，并删除同包旧版本文件（luci 相关文件每个架构目录各一份）
+      # ----------------------------------------------------------------------
+      - name: 提交文件至仓库
+        if: env.HAS_UPDATE == 'true'
+        run: |
+          echo "==> 提交文件至仓库 开始"
+          PLAN_FILE=/tmp/dufs-build/plan.json
+
+          while IFS= read -r ITEM; do
+            ARCH=$(printf '%s' "$ITEM" | jq -r '.arch')
+            PKG_NAME=$(printf '%s' "$ITEM" | jq -r '.pkg')
+            PATTERN=$(printf '%s' "$ITEM" | jq -r '.pattern')
+            DEST_DIR=$(printf '%s' "$ITEM" | jq -r '.dest_dir')
+            PKG_FILE=$(printf '%s' "$ITEM" | jq -r '.file')
+            SRC_PATH="/tmp/dufs-build/${ARCH}/${PKG_FILE}"
+
+            mkdir -p "$DEST_DIR" || exit 1
+
+            echo "==> 处理 架构 ${ARCH} / 软件包 ${PKG_NAME}"
+            echo "==> 目标目录: ${DEST_DIR}"
+
+            # 删除目标目录中同一软件包的旧版本文件
+            for OLD_FILE in "$DEST_DIR"/"${PATTERN}"*.ipk; do
+              [ -e "$OLD_FILE" ] || continue
+              echo "==> 删除旧文件: ${OLD_FILE}"
+              rm -f "$OLD_FILE" || exit 1
             done
-          done
 
-          echo ""
-          echo "=========================================="
-          echo "同步结果汇总"
-          echo "=========================================="
-          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+            echo "==> 复制文件: ${SRC_PATH} -> ${DEST_DIR}/${PKG_FILE}"
+            cp -f "$SRC_PATH" "$DEST_DIR/$PKG_FILE" \
+              || { echo "错误：复制文件失败 ${SRC_PATH}" >&2; exit 1; }
+          done < <(jq -c '.[]' "$PLAN_FILE")
 
-          if [ -s "$UPDATED_PKGS_FILE" ]; then
-            {
-              echo "updated_pkgs<<PKGS_EOF"
-              cat "$UPDATED_PKGS_FILE"
-              echo "PKGS_EOF"
-            } >> "$GITHUB_OUTPUT"
-            sort -u "$UPDATED_ARCHS_FILE" | paste -sd ',' - > /tmp/archs_uniq.txt
-            echo "updated_archs=$(cat /tmp/archs_uniq.txt)" >> "$GITHUB_OUTPUT"
-            echo "本次更新包列表："
-            sed 's/^/  - /' "$UPDATED_PKGS_FILE"
-          else
-            echo "updated_pkgs=" >> "$GITHUB_OUTPUT"
-            echo "updated_archs=" >> "$GITHUB_OUTPUT"
-            echo "所有包均为最新版本。"
+          echo "==> 当前 run/ 目录下的 IPK 文件:"
+          if [ -d run ]; then
+            find run -type f -name '*.ipk' | sort
           fi
+          echo "==> 提交文件至仓库 完成"
 
-      # --------------------------------------------------------
-      # 第4步：提交并推送到仓库
-      # --------------------------------------------------------
-      - name: 提交并推送更新
-        if: steps.download.outputs.changed == '1'
+      # ----------------------------------------------------------------------
+      # 步骤 7：提交并推送
+      # 无变更时跳过提交；提交信息使用中文模板
+      # ----------------------------------------------------------------------
+      - name: 提交并推送
+        if: env.HAS_UPDATE == 'true'
         run: |
-          set -euo pipefail
-          cd "$WORKDIR"
+          echo "==> 提交并推送 开始"
+          PLAN_FILE=/tmp/dufs-build/plan.json
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+          PKG_LIST=$(jq -r '[.[].pkg] | unique | join("、")' "$PLAN_FILE")
+          VERSION_LIST=$(jq -r '[.[].version] | unique | join("、")' "$PLAN_FILE")
 
-          # 提取版本号：优先从 dufs 主包提取
-          VERSION_INFO="unknown"
-          while IFS= read -r PKG; do
-            [ -z "$PKG" ] && continue
-            case "$PKG" in
-              dufs_*)
-                VERSION_INFO=$(echo "$PKG" | sed -E 's/dufs_([^_]+)_.*/\1/')
-                break
-                ;;
-            esac
-          done < /tmp/updated_pkgs.txt
+          # 按模板生成中文提交信息：替换 PKG_NAME / VERSION / BUILD_TIME
+          COMMIT_MSG="$COMMIT_MSG_TEMPLATE"
+          COMMIT_MSG="${COMMIT_MSG//\$\{PKG_NAME\}/$PKG_LIST}"
+          COMMIT_MSG="${COMMIT_MSG//\$\{VERSION\}/$VERSION_LIST}"
+          COMMIT_MSG="${COMMIT_MSG//\$\{BUILD_TIME\}/$BUILD_TIME}"
 
-          if [ "$VERSION_INFO" = "unknown" ]; then
-            while IFS= read -r PKG; do
-              [ -z "$PKG" ] && continue
-              case "$PKG" in
-                luci-app-dufs_*)
-                  VERSION_INFO=$(echo "$PKG" | sed -E 's/luci-app-dufs_([^_]+)_.*/\1/')
-                  break
-                  ;;
-              esac
-            done < /tmp/updated_pkgs.txt
-          fi
+          echo "==> 本次更新软件包: ${PKG_LIST}"
+          echo "==> 本次更新版本: ${VERSION_LIST}"
+          echo "==> 提交时间（北京时间）: ${BUILD_TIME}"
+          echo "==> 提交信息: ${COMMIT_MSG}"
 
-          BEIJING_NOW=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
-          ARCHS=$(cat /tmp/archs_uniq.txt 2>/dev/null || echo "")
+          # 配置 git 机器人用户
+          git config user.name "github-actions[bot]" || exit 1
+          git config user.email "github-actions[bot]@users.noreply.github.com" || exit 1
 
-          # 构造提交信息文件
-          COMMIT_MSG_FILE="/tmp/commit_msg.txt"
-          {
-            echo "🔄自动更新 dufs v${VERSION_INFO} | ${BEIJING_NOW} (北京时间)"
-            echo ""
-            echo "更新时间: ${BEIJING_NOW} (北京时间)"
-            echo "涉及架构: ${ARCHS}"
-            echo "更新的包:"
-            sed 's/^/  - /' /tmp/updated_pkgs.txt
-          } > "$COMMIT_MSG_FILE"
+          git add run/ || exit 1
 
-          echo "===== 提交信息 ====="
-          cat "$COMMIT_MSG_FILE"
-          echo "===================="
-
-          git add run/
-          # 检查是否有实际变更需要提交
           if git diff --cached --quiet; then
-            echo "没有实质变更需要提交（可能仅清理了旧文件但未新增）。"
+            echo "==> 无变更，跳过提交"
           else
-            git commit -F "$COMMIT_MSG_FILE"
-            git push
-            echo "变更已推送至仓库"
+            git commit -m "$COMMIT_MSG" || { echo "错误：提交失败" >&2; exit 1; }
+            git push || { echo "错误：推送失败" >&2; exit 1; }
+            echo "==> 推送成功"
           fi
 
-      # --------------------------------------------------------
-      # 第5步：无更新时提示
-      # --------------------------------------------------------
-      - name: 无需更新提示
-        if: steps.download.outputs.changed != '1'
-        run: |
-          echo "所有 dufs 软件包均为最新版本，无需提交。"
+          echo "==> 提交并推送 完成"
 
-      # --------------------------------------------------------
-      # 第6步：清理运行缓存
-      # --------------------------------------------------------
-      - name: 清理运行缓存
+      # ----------------------------------------------------------------------
+      # 步骤 8：结果总结
+      # 输出到 $GITHUB_STEP_SUMMARY，包含版本、架构、文件路径
+      # ----------------------------------------------------------------------
+      - name: 结果总结
         if: always()
         run: |
-          echo "开始清理工作流运行缓存..."
+          echo "==> 结果总结 开始"
+          BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+          SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
 
-          rm -f /tmp/updated_pkgs.txt /tmp/updated_archs.txt /tmp/archs_uniq.txt /tmp/commit_msg.txt 2>/dev/null || true
-          find /tmp -maxdepth 1 \( -name "tmp.*" -o -name "*.ipk.tmp" -o -name "wget-log*" \) -type f -delete 2>/dev/null || true
+          {
+            echo "## dufs IPK 自动更新结果"
+            echo ""
+            echo "- 运行时间（北京时间）：${BUILD_TIME}"
+            echo "- 强制更新：${FORCE_UPDATE:-false}"
+            echo "- 是否存在更新：${HAS_UPDATE:-unknown}"
+            echo ""
+          } >> "$SUMMARY_FILE"
 
-          find "$WORKDIR" -maxdepth 4 \( -name "*.tmp" -o -name "*.wget-tmp" -o -name "wget-log*" \) -type f -delete 2>/dev/null || true
+          if [ "${HAS_UPDATE:-false}" = "true" ] && [ -f /tmp/dufs-build/plan.json ]; then
+            {
+              echo "### 本次更新文件"
+              echo ""
+              echo "| 架构 | 软件包 | 版本 | 文件路径 |"
+              echo "| --- | --- | --- | --- |"
+              jq -r '.[] | "| \(.arch) | \(.pkg) | \(.version) | \(.dest_dir)/\(.file) |"' /tmp/dufs-build/plan.json
+              echo ""
+            } >> "$SUMMARY_FILE"
+            echo "==> 已输出本次更新文件汇总"
+          else
+            echo "本次未发现需要更新的软件包，仓库保持原状。" >> "$SUMMARY_FILE"
+            echo ""
+            echo "==> 本次无更新"
+          fi
 
-          sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
-          sudo apt-get clean 2>/dev/null || true
+          if [ -f /tmp/dufs-build/upstream.json ]; then
+            {
+              echo "### 上游最新版本一览"
+              echo ""
+              echo "| 架构 | 软件包 | 版本 | 文件名 |"
+              echo "| --- | --- | --- | --- |"
+              jq -r '.[] | "| \(.arch) | \(.pkg) | \(.version) | \(.file) |"' /tmp/dufs-build/upstream.json
+            } >> "$SUMMARY_FILE"
+            echo "==> 已输出上游最新版本一览"
+          fi
 
-          echo "运行缓存清理完成"
+          echo "==> 结果总结 完成"
+
+      # ----------------------------------------------------------------------
+      # 步骤 9：清理临时文件
+      # 删除 /tmp/dufs-build，不影响仓库已提交文件
+      # ----------------------------------------------------------------------
+      - name: 清理临时文件
+        if: always()
+        run: |
+          echo "==> 清理临时文件 开始"
+          if [ -d /tmp/dufs-build ]; then
+            echo "==> 删除目录: /tmp/dufs-build"
+            rm -rf /tmp/dufs-build || exit 1
+          else
+            echo "==> 临时目录不存在，无需清理"
+          fi
+          echo "==> 清理临时文件 完成"
