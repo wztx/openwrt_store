@@ -1,311 +1,367 @@
-# =============================================================================
-# 工作流名称：同步 luci-app-taskplan 上游最新版本
-# 功能说明：每天定时 / 手动触发，从 sirpdboy/luci-app-taskplan Releases 拉取
-#           openwrt-24.10 的 x86_64 与 aarch64_generic 包，解压出全部 ipk，
-#           按架构分发到本仓库对应目录，并清理本工作流产生的旧版本文件。
-# 使用环境：OpenWrt 24.10
-# =============================================================================
-
-name: 自动更新 luci-app-taskplan IPK 软件包
+# ============================================================================
+# 工作流：自动更新 taskplan IPK 软件包
+# 作用：定时 / 手动从上游 release 拉取 openwrt-24.10-x86_64.tar.gz，
+#      解压提取 .ipk 文件，分发到 run/x86_64 与 run/aarch64 目录并提交。
+# 说明：本工作流不构建 IPK、不修改 IPK 内部文件、不处理 control 脚本。
+# ============================================================================
+name: 自动更新 taskplan IPK 软件包
 
 on:
-  # ---- 定时触发：每天北京时间 06:21 执行（GitHub 原生 schedule 为 UTC，UTC+8=北京时间）----
+  # 定时触发：每天 UTC 22:21，即北京时间次日 06:21
   schedule:
-    - cron: '21 22 * * *'    # UTC 22:21 = 北京时间次日 06:21
-      timezone: 'Asia/Shanghai'
-
-  # ---- 手动触发：支持一键强制更新 ----
+    - cron: '21 22 * * *'
+  # 手动触发：提供 force_update 布尔开关，默认 false
   workflow_dispatch:
     inputs:
-      force:
-        description: '强制更新（忽略本地版本对比，强制覆盖）'
+      force_update:
+        description: '是否强制更新（true / false）'
         required: false
-        type: boolean
         default: false
+        type: boolean
 
-# ---- 并发限制：同一分支同一工作流同一时间只运行一个，旧运行自动取消 ----
+# 并发控制：同一工作流同一分支不并发，但不取消已进行的运行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
-# ---- 工作权限：需要推送代码到本仓库 ----
+# 需要写权限才能推送提交
 permissions:
   contents: write
 
+# ---------------------------------------------------------------------------
+# 固定配置：不随每次运行变化
+# 运行时变量（VERSION / ASSET_URL / FORCE_UPDATE / BUILD_TIME / WORK_DIR 等）
+# 由各步骤通过 $GITHUB_ENV 动态设置
+# ---------------------------------------------------------------------------
+env:
+  # 上游 release 列表 API
+  UPSTREAM_API: https://api.github.com/repos/sirpdboy/luci-app-taskplan/releases
+  # 需要下载的上游资产名称
+  UPSTREAM_ASSET: openwrt-24.10-x86_64.tar.gz
+  # 软件包名称
+  PKG_NAME: luci-app-taskplan
+  # 在 run/<arch>/ 下的子目录名称
+  PKG_DIR_NAME: luci-app-taskplan
+  # 时区
+  TZ: Asia/Shanghai
+  # 架构矩阵：x86_64 复制全部 ipk；aarch64 仅复制 luci-*_all.ipk
+  ARCH_MATRIX: |
+    [
+      {
+        "arch": "x86_64",
+        "dest_dir": "run/x86_64",
+        "only_all": false
+      },
+      {
+        "arch": "aarch64_generic",
+        "dest_dir": "run/aarch64",
+        "only_all": true
+      }
+    ]
+  # 提交信息模板，${XXX} 由步骤 6 中的 Python 进行替换
+  COMMIT_MSG_TEMPLATE: "🔄自动更新 ${PKG_NAME} ${VERSION} | ${BUILD_TIME}(北京时间)"
+
 jobs:
-  sync:
-    name: 同步上游版本
+  update-ipk:
+    name: 更新 taskplan IPK
     runs-on: ubuntu-latest
 
-    env:
-      UPSTREAM_REPO: 'sirpdboy/luci-app-taskplan'
-      OPENWRT_VER: '24.10'
-      UA: 'GitHub-Actions-Sync-Bot/1.0 (+https://github.com/${{ github.repository }})'
-      TMP_DIR: '${{ github.workspace }}/.tmp_sync'
-      # 架构与目标目录映射：<release资产中的arch后缀>=<本地存放目录>
-      ARCH_X86:    'x86_64'
-      ARCH_ARM64:  'aarch64_generic'
-      DEST_X86:    'run/x86_64/luci-app-taskplan'
-      DEST_ARM64:  'run/aarch64/luci-app-taskplan'
-
     steps:
-      # ============================================================
-      # 步骤 0：检出本仓库代码
-      # ============================================================
+      # ---------------------------------------------------------------------
+      # 步骤 1：检出仓库代码
+      # ---------------------------------------------------------------------
       - name: 检出仓库代码
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0    # 拉取完整历史，避免推送时 ref 不全
+          fetch-depth: 0
 
-      # ============================================================
-      # 步骤 1：初始化临时目录、设置北京时间变量、配置 Git 身份
-      # ============================================================
-      - name: 初始化运行环境
-        id: init
+      - name: 输出检出信息
         run: |
-          set -euo pipefail
-          # 创建临时工作目录（位于 workspace 内，避免目录漂移污染系统目录）
-          rm -rf "$TMP_DIR"
-          mkdir -p "$TMP_DIR"
-          # 北京时间
-          BJ_TIME="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          echo "BJ_TIME=${BJ_TIME}" >> "$GITHUB_ENV"
-          echo "BJ_DATE=$(TZ='Asia/Shanghai' date '+%Y%m%d%H%M%S')" >> "$GITHUB_ENV"
-          echo "FORCE_UPDATE=${{ github.event.inputs.force || 'false' }}" >> "$GITHUB_ENV"
-          # Git 身份
-          git config --global user.name  'github-actions[bot]'
-          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          echo "==> 检出仓库代码 开始"
+          echo "当前分支: ${{ github.ref }}"
+          echo "==> 检出仓库代码 完成"
 
-      # ============================================================
-      # 步骤 2：获取上游最新版本（包含预发布版，跳过 draft；不使用 /latest）
-      # ============================================================
-      - name: 获取上游最新版本信息
-        id: latest
+      # ---------------------------------------------------------------------
+      # 步骤 2：获取上游最新版本号
+      # 过滤 draft，按 published_at 降序取最新，找到目标资产下载 URL
+      # ---------------------------------------------------------------------
+      - name: 获取上游最新版本号
         run: |
-          set -euo pipefail
-          RESP="$TMP_DIR/releases.json"
-          echo "[获取版本] 正在请求 GitHub API ..."
-          curl -fsSL \
-            --retry 3 --retry-delay 2 \
-            -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: ${UA}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=20" \
-            -o "$RESP"
-          # 取第一个非 draft 的 release（API 按 published_at 倒序返回，即最新版本，含 prerelease）
-          TAG="$(python3 -c '
-          import json,sys
-          data=json.load(open(sys.argv[1]))
-          for r in data:
-              if not r.get("draft",False):
-                  print(r["tag_name"]); sys.exit(0)
-          sys.exit("未找到可用的 release")
-          ' "$RESP")"
-          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "[获取版本] 最新版本标签: ${TAG}"
+          echo "==> 获取上游最新版本号 开始"
+          python3 <<'PY'
+          import json, urllib.request, os
 
-          # 解析出两个目标资产的下载 URL
-          URL_X86="$(python3 -c '
-          import json,sys
-          data=json.load(open(sys.argv[1]))
-          tag=sys.argv[2]; arch=sys.argv[3]; ver=sys.argv[4]
-          target=f"openwrt-{ver}-{arch}.tar.gz"
-          for r in data:
-              if r.get("tag_name")!=tag or r.get("draft"): continue
-              for a in r.get("assets",[]):
-                  if a["name"]==target:
-                      print(a["browser_download_url"]); sys.exit(0)
-          sys.exit(f"未找到资产 {target}")
-          ' "$RESP" "$TAG" "$ARCH_X86" "$OPENWRT_VER")"
-          URL_ARM64="$(python3 -c '
-          import json,sys
-          data=json.load(open(sys.argv[1]))
-          tag=sys.argv[2]; arch=sys.argv[3]; ver=sys.argv[4]
-          target=f"openwrt-{ver}-{arch}.tar.gz"
-          for r in data:
-              if r.get("tag_name")!=tag or r.get("draft"): continue
-              for a in r.get("assets",[]):
-                  if a["name"]==target:
-                      print(a["browser_download_url"]); sys.exit(0)
-          sys.exit(f"未找到资产 {target}")
-          ' "$RESP" "$TAG" "$ARCH_ARM64" "$OPENWRT_VER")"
-          echo "URL_X86=${URL_X86}"    >> "$GITHUB_OUTPUT"
-          echo "URL_ARM64=${URL_ARM64}" >> "$GITHUB_OUTPUT"
-          echo "[获取版本] x86_64    下载地址: ${URL_X86}"
-          echo "[获取版本] aarch64_generic 下载地址: ${URL_ARM64}"
+          # 读取固定配置
+          api = os.environ["UPSTREAM_API"]
+          asset_name = os.environ["UPSTREAM_ASSET"]
+          print(f"==> 请求上游 API: {api}")
 
-      # ============================================================
-      # 步骤 3：下载并解压两个架构的 tar.gz 包
-      # ============================================================
-      - name: 下载上游发行包
+          # 必须带 User-Agent，否则 GitHub API 会返回 403
+          req = urllib.request.Request(api, headers={"User-Agent": "taskplan-ipk-updater"})
+          with urllib.request.urlopen(req, timeout=60) as resp:
+              releases = json.load(resp)
+
+          # 过滤草稿版本
+          releases = [r for r in releases if not r.get("draft")]
+          if not releases:
+              raise SystemExit("错误：未找到可用的上游 release")
+
+          # 按发布时间降序排序，取最新
+          releases.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+          release = releases[0]
+          tag = release["tag_name"]
+
+          # 去掉 v 前缀得到版本号
+          version = tag[1:] if tag.startswith("v") else tag
+
+          # 在 assets 中匹配目标下载 URL
+          asset_url = ""
+          for asset in release.get("assets", []):
+              if asset.get("name") == asset_name:
+                  asset_url = asset.get("browser_download_url", "")
+                  break
+
+          if not asset_url:
+              raise SystemExit(f"错误：未在 release {tag} 中找到资产 {asset_name}")
+
+          print(f"==> 最新 tag: {tag}，解析版本号: {version}")
+          print(f"==> 资产下载 URL: {asset_url}")
+
+          # 写入 $GITHUB_ENV，供后续步骤使用
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"VERSION={version}\n")
+              f.write(f"ASSET_URL={asset_url}\n")
+          PY
+          echo "==> 获取上游最新版本号 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 3：读取触发参数
+      # ---------------------------------------------------------------------
+      - name: 读取触发参数
+        env:
+          FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
         run: |
-          set -euo pipefail
-          mkdir -p "$TMP_DIR/download" "$TMP_DIR/extract"
-          for pair in "${ARCH_X86}:${{ steps.latest.outputs.URL_X86 }}" "${ARCH_ARM64}:${{ steps.latest.outputs.URL_ARM64}}"; do
-            arch="${pair%%:*}"
-            url="${pair#*:}"
-            out="$TMP_DIR/download/${arch}.tar.gz"
-            echo "[下载] ${arch} <- ${url}"
-            curl -fSL \
-              --retry 3 --retry-delay 3 \
-              --connect-timeout 15 --max-time 300 \
-              -H "User-Agent: ${UA}" \
-              "$url" -o "$out"
-            ls -lh "$out"
-          done
+          echo "==> 读取触发参数 开始"
+          echo "==> 强制更新: $FORCE_UPDATE"
+          echo "FORCE_UPDATE=$FORCE_UPDATE" >> "$GITHUB_ENV"
+          echo "==> 读取触发参数 完成"
 
-      - name: 解压并提取所有 ipk 文件
-        id: extract
+      # ---------------------------------------------------------------------
+      # 步骤 4：下载并解压上游资产
+      # 校验：下载文件非空 + 解压成功 + 至少提取到一个 .ipk
+      # ---------------------------------------------------------------------
+      - name: 下载并解压上游资产
         run: |
-          set -euo pipefail
-          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
-            src="$TMP_DIR/download/${arch}.tar.gz"
-            dst="$TMP_DIR/extract/${arch}"
-            mkdir -p "$dst"
-            echo "[解压] ${arch} -> ${dst}"
-            # 使用 --strip-components=0 保留内部结构，避免因上游目录结构变化导致漂移
-            tar -xzf "$src" -C "$dst" --no-same-owner --no-same-permissions
-            # 收集所有 ipk 文件名（仅 basename），用于后续版本对比
-            find "$dst" -type f -name '*.ipk' -printf '%f\n' | LC_ALL=C sort -u > "$TMP_DIR/ipk_list_${arch}.txt"
-            cnt="$(wc -l < "$TMP_DIR/ipk_list_${arch}.txt" | tr -d ' ')"
-            echo "  -> 提取到 ${cnt} 个 ipk 文件:"
-            sed 's/^/      /' "$TMP_DIR/ipk_list_${arch}.txt"
-            if [ "${cnt}" -eq 0 ]; then
-              echo "[错误] ${arch} 包内未找到任何 .ipk 文件，可能上游包结构发生变化，中止。" >&2
-              exit 1
-            fi
-          done
+          echo "==> 下载并解压上游资产 开始"
+          WORK_DIR="/tmp/taskplan-build"
+          DOWNLOAD_FILE="$WORK_DIR/$UPSTREAM_ASSET"
+          EXTRACT_DIR="$WORK_DIR/extract"
 
-      # ============================================================
-      # 步骤 4：版本对比 —— 纯文件名对比，目标目录已全部存在则跳过
-      # ============================================================
-      - name: 版本对比（本地是否已是最新）
-        id: check
+          # 清理并重建临时目录
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR" "$EXTRACT_DIR"
+
+          echo "==> 下载 URL: $ASSET_URL"
+          echo "==> 保存路径: $DOWNLOAD_FILE"
+
+          # 下载（带 User-Agent），失败则显式 exit 1
+          curl -L -H "User-Agent: taskplan-ipk-updater" -o "$DOWNLOAD_FILE" "$ASSET_URL" || {
+            echo "错误：下载上游资产失败" >&2
+            exit 1
+          }
+
+          # 校验下载文件存在且非空
+          [ -s "$DOWNLOAD_FILE" ] || {
+            echo "错误：下载文件为空" >&2
+            exit 1
+          }
+
+          echo "==> 下载文件大小: $(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
+
+          # 解压
+          tar -xzf "$DOWNLOAD_FILE" -C "$EXTRACT_DIR" || {
+            echo "错误：解压上游资产失败" >&2
+            exit 1
+          }
+
+          echo "==> 解压目录: $EXTRACT_DIR"
+          echo "==> 发现的 .ipk 文件:"
+          find "$EXTRACT_DIR" -type f -name '*.ipk' -print
+
+          # 确认至少有一个 ipk，否则报错
+          IPK_COUNT=$(find "$EXTRACT_DIR" -type f -name '*.ipk' | wc -l)
+          [ "$IPK_COUNT" -gt 0 ] || {
+            echo "错误：压缩包内未找到任何 .ipk 文件" >&2
+            exit 1
+          }
+
+          # 写入 $GITHUB_ENV
+          {
+            echo "WORK_DIR=$WORK_DIR"
+            echo "DOWNLOAD_FILE=$DOWNLOAD_FILE"
+            echo "EXTRACT_DIR=$EXTRACT_DIR"
+          } >> "$GITHUB_ENV"
+
+          echo "==> 下载并解压上游资产 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 5：分发 .ipk 到提交目录
+      # - 仅在下载解压成功后才会走到此处，避免误删旧文件
+      # - 先清理目标目录中的旧 ipk，再复制本次文件
+      # - aarch64 只保留 luci-*_all.ipk（全架构包，每个架构各放一份）
+      # ---------------------------------------------------------------------
+      - name: 分发 .ipk 到提交目录
         run: |
-          set -euo pipefail
-          NEED_UPDATE="false"
-          declare -A DEST_MAP=( ["$ARCH_X86"]="$DEST_X86" ["$ARCH_ARM64"]="$DEST_ARM64" )
-          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
-            dest="${DEST_MAP[$arch]}"
-            list="$TMP_DIR/ipk_list_${arch}.txt"
-            missing=0
-            total=0
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              total=$((total+1))
-              if [ ! -f "${GITHUB_WORKSPACE}/${dest}/${f}" ]; then
-                missing=$((missing+1))
-                echo "[对比] ${arch} 缺少文件: ${f}"
-              fi
-            done < "$list"
-            if [ "$missing" -gt 0 ]; then
-              echo "[对比] ${arch}: 共 ${total} 个文件，缺失 ${missing} 个，需要更新。"
-              NEED_UPDATE="true"
-            else
-              echo "[对比] ${arch}: 共 ${total} 个文件，本地全部存在。"
-            fi
-          done
-          if [ "${FORCE_UPDATE}" = "true" ]; then
-            echo "[对比] 已选择强制更新。"
-            NEED_UPDATE="true"
-          fi
-          echo "NEED_UPDATE=${NEED_UPDATE}" >> "$GITHUB_OUTPUT"
-          if [ "${NEED_UPDATE}" = "false" ]; then
-            echo "[对比] 所有目标文件已存在，无需更新，流程结束。"
-          fi
+          echo "==> 分发 .ipk 到提交目录 开始"
+          python3 <<'PY'
+          import json, os, glob, shutil
 
-      # ============================================================
-      # 步骤 5：清理旧版本文件（仅删除本工作流管辖的 ipk，严禁误删其他）
-      #         + 复制新 ipk 到目标目录
-      # ============================================================
-      - name: 清理旧版本并同步新文件
-        if: steps.check.outputs.NEED_UPDATE == 'true'
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          extract_dir = os.environ["EXTRACT_DIR"]
+          pkg_dir_name = os.environ["PKG_DIR_NAME"]
+
+          # 递归查找解压目录中的全部 .ipk
+          ipks = glob.glob(os.path.join(extract_dir, "**", "*.ipk"), recursive=True)
+          print(f"==> 共发现 {len(ipks)} 个 .ipk 文件")
+
+          summary_lines = []
+          for item in matrix:
+              arch = item["arch"]
+              dest_dir = item["dest_dir"]
+              only_all = item["only_all"]
+              target_dir = os.path.join(dest_dir, pkg_dir_name)
+
+              print(f"==> 处理架构: {arch}")
+              print(f"==> 目标目录: {target_dir}")
+              print(f"==> ONLY_ALL: {only_all}")
+
+              # 按规则筛选：only_all 为 true 时仅保留 luci-*_all.ipk
+              selected = []
+              for src in ipks:
+                  base = os.path.basename(src)
+                  if only_all and not (base.startswith("luci-") and base.endswith("_all.ipk")):
+                      continue
+                  selected.append(src)
+
+              if not selected:
+                  # x86_64 必须至少匹配到一个文件；其它架构可跳过
+                  if arch == "x86_64":
+                      raise SystemExit(f"错误：架构 {arch} 未匹配到任何 .ipk 文件")
+                  print(f"警告：架构 {arch} 未匹配到任何 .ipk 文件，跳过清理与复制")
+                  summary_lines.append(f"- {arch} -> {target_dir}: 0 个文件（跳过）")
+                  continue
+
+              os.makedirs(target_dir, exist_ok=True)
+
+              # 先清理目标目录中的旧 .ipk，再复制新文件
+              old_files = glob.glob(os.path.join(target_dir, "*.ipk"))
+              for old in old_files:
+                  os.remove(old)
+                  print(f"==> 已清理旧文件: {old}")
+
+              # 复制时保留原文件名
+              for src in selected:
+                  base = os.path.basename(src)
+                  dst = os.path.join(target_dir, base)
+                  shutil.copy2(src, dst)
+                  print(f"==> 已复制: {src} -> {dst}")
+
+              print(f"==> 架构 {arch} 完成，复制 {len(selected)} 个文件")
+              summary_lines.append(f"- {arch} -> {target_dir}: {len(selected)} 个文件")
+
+          # 写一份架构级明细，供步骤 7 结果总结使用
+          with open("/tmp/taskplan-build/arch-summary.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(summary_lines) + "\n")
+          PY
+          echo "==> 分发 .ipk 到提交目录 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 6：提交并推送
+      # - BUILD_TIME 使用北京时间
+      # - 无变更时跳过提交，避免空提交
+      # ---------------------------------------------------------------------
+      - name: 提交并推送
         run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          declare -A DEST_MAP=( ["$ARCH_X86"]="$DEST_X86" ["$ARCH_ARM64"]="$DEST_ARM64" )
-          for arch in "$ARCH_X86" "$ARCH_ARM64"; do
-            dest="${DEST_MAP[$arch]}"
-            src_dir="$TMP_DIR/extract/${arch}"
-            list="$TMP_DIR/ipk_list_${arch}.txt"
-            echo "[同步] ${arch} -> ${dest}"
-            mkdir -p "$dest"
+          echo "==> 提交并推送 开始"
 
-            # ---- 安全清理：仅删除与本工作流明确相关的旧 ipk 文件 ----
-            # 匹配模式：luci-app-taskplan*.ipk / luci-i18n-taskplan*.ipk
-            # 使用 find -maxdepth 1 避免进入其他子目录，且仅删 .ipk
-            echo "[清理] 精确移除 ${dest} 下的旧版 luci-app-taskplan / luci-i18n-taskplan ipk ..."
-            find "$dest" -maxdepth 1 -type f \( \
-                -name 'luci-app-taskplan*.ipk' -o \
-                -name 'luci-i18n-taskplan*.ipk' \
-              \) -print -delete || true
+          # 生成北京时间
+          BUILD_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          export BUILD_TIME
+          echo "==> 构建时间: $BUILD_TIME"
+          echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
 
-            # ---- 复制新 ipk 到目标目录（仅 .ipk 文件，保留文件名）----
-            # 用 find 递归查找解压后的 ipk 并复制（兼容上游可能的子目录结构）
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              # 在解压目录里定位该文件
-              src_path="$(find "$src_dir" -type f -name "$f" -print -quit)"
-              if [ -z "$src_path" ]; then
-                echo "[错误] 在 ${src_dir} 中找不到 ${f}"
-                exit 1
-              fi
-              cp -f "$src_path" "${dest}/${f}"
-              echo "  -> 复制 ${f}"
-            done < "$list"
-          done
-          echo "[同步] 文件同步完成。"
+          # 用 Python 替换提交信息模板中的变量
+          COMMIT_MSG=$(python3 - <<'PY'
+          import os
+          tpl = os.environ["COMMIT_MSG_TEMPLATE"]
+          msg = tpl.replace("${PKG_NAME}", os.environ["PKG_NAME"])
+          msg = msg.replace("${VERSION}", os.environ["VERSION"])
+          msg = msg.replace("${BUILD_TIME}", os.environ["BUILD_TIME"])
+          print(msg)
+          PY
+          )
 
-      # ============================================================
-      # 步骤 6：提交并推送变更
-      # ============================================================
-      - name: 提交并推送到仓库
-        if: steps.check.outputs.NEED_UPDATE == 'true'
-        id: commit
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          VERSION="${{ steps.latest.outputs.VERSION }}"
-          BJ_TIME="${BJ_TIME}"
-          # 添加变更
-          git add -- "$DEST_X86" "$DEST_ARM64"
-          # 检查是否存在实际变更
+          echo "==> 提交信息: $COMMIT_MSG"
+
+          # 配置 git 提交身份
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 暂存产物目录
+          git add run/
+
+          # 判断是否存在变更，无变更则跳过提交
           if git diff --cached --quiet; then
-            echo "[提交] 无实质变更，跳过提交。"
-            echo "COMMITTED=false" >> "$GITHUB_OUTPUT"
+            echo "==> 无变更，跳过提交"
           else
-            COMMIT_MSG="🔄自动更新 luci-app-taskplan v${VERSION} |  ${BJ_TIME}(北京时间)"
-            echo "[提交] 提交信息: ${COMMIT_MSG}"
-            git commit -m "${COMMIT_MSG}"
+            git commit -m "$COMMIT_MSG"
             git push
-            echo "COMMITTED=true" >> "$GITHUB_OUTPUT"
-            echo "[提交] 推送成功。"
+            echo "==> 已推送提交"
           fi
 
-      - name: 同步结果摘要
-        if: always()
+          echo "==> 提交并推送 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 7：结果总结
+      # 使用 $GITHUB_STEP_SUMMARY 输出本次更新汇总
+      # ---------------------------------------------------------------------
+      - name: 结果总结
         run: |
-          NEED="${{ steps.check.outputs.NEED_UPDATE }}"
-          COMMITTED="${{ steps.commit.outputs.COMMITTED }}"
-          if [ "${NEED}" != "true" ]; then
-            echo "==> 本地已是最新版本 ${{ steps.latest.outputs.TAG }}，无需更新。"
-          elif [ "${COMMITTED}" = "true" ]; then
-            echo "==> 已成功同步并推送 v${{ steps.latest.outputs.VERSION }} 到仓库。"
-          else
-            echo "==> 文件已同步但无实质差异，未产生新提交。"
+          echo "==> 结果总结 开始"
+
+          ARCH_SUMMARY=""
+          if [ -f /tmp/taskplan-build/arch-summary.txt ]; then
+            ARCH_SUMMARY=$(cat /tmp/taskplan-build/arch-summary.txt)
           fi
 
-      # ============================================================
-      # 步骤 7：无论成功失败，始终清理临时文件，避免污染工作区
-      # ============================================================
-      - name: 清理临时文件
+          {
+            echo "## taskplan IPK 自动更新结果"
+            echo ""
+            echo "- 上游版本: $VERSION"
+            echo "- 下载资产: $UPSTREAM_ASSET"
+            echo "- 下载 URL: $ASSET_URL"
+            echo "- 强制更新: $FORCE_UPDATE"
+            echo "- 构建时间: $BUILD_TIME"
+            echo "- 提交信息模板: $COMMIT_MSG_TEMPLATE"
+            echo "- x86_64 目录: run/x86_64/$PKG_DIR_NAME"
+            echo "- aarch64 目录: run/aarch64/$PKG_DIR_NAME"
+            echo ""
+            echo "### 架构分发明细"
+            echo ""
+            echo "$ARCH_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "==> 结果总结 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 8：清理缓存和临时文件
+      # 始终执行，避免残留临时目录
+      # ---------------------------------------------------------------------
+      - name: 清理缓存和临时文件
         if: always()
         run: |
-          if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR}" ]; then
-            echo "[清理] 删除临时目录: ${TMP_DIR}"
-            rm -rf "${TMP_DIR}"
-          fi
-          echo "[清理] 完成。"
+          echo "==> 清理缓存和临时文件 开始"
+          rm -rf /tmp/taskplan-build
+          echo "==> 已清理: /tmp/taskplan-build"
+          echo "==> 清理缓存和临时文件 完成"
