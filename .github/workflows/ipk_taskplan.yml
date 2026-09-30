@@ -1,7 +1,7 @@
 # ============================================================================
 # 工作流：自动更新 taskplan IPK 软件包
 # 作用：定时 / 手动从上游 release 拉取 openwrt-24.10-x86_64.tar.gz，
-#      解压提取 .ipk 文件，分发到 run/x86_64 与 run/aarch64 目录并提交。
+#      解压提取 .ipk 文件，通过版本对比决定是否分发，最终提交。
 # 说明：本工作流不构建 IPK、不修改 IPK 内部文件、不处理 control 脚本。
 # ============================================================================
 name: 自动更新 taskplan IPK 软件包
@@ -30,8 +30,8 @@ permissions:
 
 # ---------------------------------------------------------------------------
 # 固定配置：不随每次运行变化
-# 运行时变量（VERSION / ASSET_URL / FORCE_UPDATE / BUILD_TIME / WORK_DIR 等）
-# 由各步骤通过 $GITHUB_ENV 动态设置
+# 运行时变量（VERSION / ASSET_URL / FORCE_UPDATE / BUILD_TIME / WORK_DIR /
+#           NEED_UPDATE_ARCHS / SKIPPED_ARCHS 等）由步骤通过 $GITHUB_ENV 设置
 # ---------------------------------------------------------------------------
 env:
   # 上游 release 列表 API
@@ -58,7 +58,7 @@ env:
         "only_all": true
       }
     ]
-  # 提交信息模板，${XXX} 由步骤 6 中的 Python 进行替换
+  # 提交信息模板，${XXX} 由步骤 7 中的 Python 进行替换
   COMMIT_MSG_TEMPLATE: "🔄自动更新 ${PKG_NAME} ${VERSION} | ${BUILD_TIME}(北京时间)"
 
 jobs:
@@ -69,6 +69,7 @@ jobs:
     steps:
       # ---------------------------------------------------------------------
       # 步骤 1：检出仓库代码
+      # fetch-depth: 0 保证能拿到完整历史，便于后续 git diff 判断变更
       # ---------------------------------------------------------------------
       - name: 检出仓库代码
         uses: actions/checkout@v7
@@ -137,6 +138,7 @@ jobs:
 
       # ---------------------------------------------------------------------
       # 步骤 3：读取触发参数
+      # force_update 为 true 时跳过版本对比，强制重新分发
       # ---------------------------------------------------------------------
       - name: 读取触发参数
         env:
@@ -150,6 +152,7 @@ jobs:
       # ---------------------------------------------------------------------
       # 步骤 4：下载并解压上游资产
       # 校验：下载文件非空 + 解压成功 + 至少提取到一个 .ipk
+      # 注意：本步骤只做下载解压，不清理任何目标目录
       # ---------------------------------------------------------------------
       - name: 下载并解压上游资产
         run: |
@@ -206,9 +209,96 @@ jobs:
           echo "==> 下载并解压上游资产 完成"
 
       # ---------------------------------------------------------------------
-      # 步骤 5：分发 .ipk 到提交目录
-      # - 仅在下载解压成功后才会走到此处，避免误删旧文件
-      # - 先清理目标目录中的旧 ipk，再复制本次文件
+      # 步骤 5：版本对比检查
+      # 通过“本次解压得到的 .ipk 文件名集合”与“目标目录现有 .ipk 文件名集合”
+      # 是否一致来判断是否需要更新：
+      #   - force_update=true：强制标记为需要更新
+      #   - 集合完全一致：跳过该架构，不清理、不复制
+      #   - 目标目录不存在 / 为空 / 集合不一致：需要更新
+      # 结果写入 NEED_UPDATE_ARCHS 与 SKIPPED_ARCHS
+      # ---------------------------------------------------------------------
+      - name: 版本对比检查
+        run: |
+          echo "==> 版本对比检查 开始"
+          python3 <<'PY'
+          import json, os, glob
+
+          matrix = json.loads(os.environ["ARCH_MATRIX"])
+          extract_dir = os.environ["EXTRACT_DIR"]
+          pkg_dir_name = os.environ["PKG_DIR_NAME"]
+          force_update = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
+          version = os.environ.get("VERSION", "")
+
+          print(f"==> 上游版本: {version}")
+          print(f"==> 强制更新: {force_update}")
+
+          # 本次解压得到的全部 .ipk
+          ipks = glob.glob(os.path.join(extract_dir, "**", "*.ipk"), recursive=True)
+          print(f"==> 解压目录共发现 {len(ipks)} 个 .ipk 文件")
+
+          need_update_archs = []
+          skipped_archs = []
+
+          for item in matrix:
+              arch = item["arch"]
+              dest_dir = item["dest_dir"]
+              only_all = item["only_all"]
+              target_dir = os.path.join(dest_dir, pkg_dir_name)
+
+              # 按 only_all 规则筛选本次选中文件名集合
+              selected_set = set()
+              for src in ipks:
+                  base = os.path.basename(src)
+                  if only_all and not (base.startswith("luci-") and base.endswith("_all.ipk")):
+                      continue
+                  selected_set.add(base)
+
+              # 收集目标目录现有 .ipk 文件名集合
+              existing_set = set()
+              if os.path.isdir(target_dir):
+                  existing_set = {os.path.basename(p)
+                                  for p in glob.glob(os.path.join(target_dir, "*.ipk"))}
+
+              print(f"==> 架构: {arch}")
+              print(f"==> DEST_DIR: {dest_dir}")
+              print(f"==> ONLY_ALL: {only_all}")
+              print(f"==> 目标目录: {target_dir}")
+              print(f"==> 本次选中文件: {sorted(selected_set)}")
+              print(f"==> 现有文件: {sorted(existing_set)}")
+
+              # 未匹配到任何文件：x86_64 必须报错；其它架构跳过
+              if not selected_set:
+                  if arch == "x86_64":
+                      raise SystemExit(f"错误：架构 {arch} 未匹配到任何 .ipk 文件")
+                  print(f"警告：架构 {arch} 未匹配到任何 .ipk 文件，标记为跳过")
+                  skipped_archs.append(arch)
+                  continue
+
+              # 版本对比判断
+              if force_update:
+                  print(f"==> 架构 {arch} 因 force_update=true 需要更新")
+                  need_update_archs.append(arch)
+              elif existing_set == selected_set:
+                  print(f"==> 架构 {arch} 文件集合一致，跳过更新")
+                  skipped_archs.append(arch)
+              else:
+                  print(f"==> 架构 {arch} 文件集合不一致，需要更新")
+                  need_update_archs.append(arch)
+
+          # 写入 $GITHUB_ENV，供后续步骤使用
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("NEED_UPDATE_ARCHS=" + " ".join(need_update_archs) + "\n")
+              f.write("SKIPPED_ARCHS=" + " ".join(skipped_archs) + "\n")
+
+          print(f"==> 需要更新的架构: {need_update_archs}")
+          print(f"==> 跳过的架构: {skipped_archs}")
+          PY
+          echo "==> 版本对比检查 完成"
+
+      # ---------------------------------------------------------------------
+      # 步骤 6：分发 .ipk 到提交目录
+      # - 仅处理 NEED_UPDATE_ARCHS 中的架构
+      # - 下载解压成功且版本对比完成后才清理旧文件，避免误删
       # - aarch64 只保留 luci-*_all.ipk（全架构包，每个架构各放一份）
       # ---------------------------------------------------------------------
       - name: 分发 .ipk 到提交目录
@@ -220,6 +310,14 @@ jobs:
           matrix = json.loads(os.environ["ARCH_MATRIX"])
           extract_dir = os.environ["EXTRACT_DIR"]
           pkg_dir_name = os.environ["PKG_DIR_NAME"]
+          need_update_archs = os.environ.get("NEED_UPDATE_ARCHS", "").split()
+
+          print(f"==> 需要更新的架构: {need_update_archs}")
+
+          # 若无需更新任何架构，直接跳过整个分发流程
+          if not need_update_archs:
+              print("==> 无需要更新的架构，跳过分发")
+              raise SystemExit(0)
 
           # 递归查找解压目录中的全部 .ipk
           ipks = glob.glob(os.path.join(extract_dir, "**", "*.ipk"), recursive=True)
@@ -232,11 +330,17 @@ jobs:
               only_all = item["only_all"]
               target_dir = os.path.join(dest_dir, pkg_dir_name)
 
+              # 仅处理需要更新的架构
+              if arch not in need_update_archs:
+                  print(f"==> 架构 {arch} 无需更新，跳过")
+                  summary_lines.append(f"- {arch} -> {target_dir}: 跳过（无需更新）")
+                  continue
+
               print(f"==> 处理架构: {arch}")
               print(f"==> 目标目录: {target_dir}")
               print(f"==> ONLY_ALL: {only_all}")
 
-              # 按规则筛选：only_all 为 true 时仅保留 luci-*_all.ipk
+              # 按规则筛选
               selected = []
               for src in ipks:
                   base = os.path.basename(src)
@@ -270,14 +374,14 @@ jobs:
               print(f"==> 架构 {arch} 完成，复制 {len(selected)} 个文件")
               summary_lines.append(f"- {arch} -> {target_dir}: {len(selected)} 个文件")
 
-          # 写一份架构级明细，供步骤 7 结果总结使用
+          # 写一份架构级明细，供步骤 8 结果总结使用
           with open("/tmp/taskplan-build/arch-summary.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(summary_lines) + "\n")
           PY
           echo "==> 分发 .ipk 到提交目录 完成"
 
       # ---------------------------------------------------------------------
-      # 步骤 6：提交并推送
+      # 步骤 7：提交并推送
       # - BUILD_TIME 使用北京时间
       # - 无变更时跳过提交，避免空提交
       # ---------------------------------------------------------------------
@@ -323,7 +427,7 @@ jobs:
           echo "==> 提交并推送 完成"
 
       # ---------------------------------------------------------------------
-      # 步骤 7：结果总结
+      # 步骤 8：结果总结
       # 使用 $GITHUB_STEP_SUMMARY 输出本次更新汇总
       # ---------------------------------------------------------------------
       - name: 结果总结
@@ -342,8 +446,9 @@ jobs:
             echo "- 下载资产: $UPSTREAM_ASSET"
             echo "- 下载 URL: $ASSET_URL"
             echo "- 强制更新: $FORCE_UPDATE"
+            echo "- 需要更新的架构: ${NEED_UPDATE_ARCHS:-无}"
+            echo "- 跳过的架构: ${SKIPPED_ARCHS:-无}"
             echo "- 构建时间: $BUILD_TIME"
-            echo "- 提交信息模板: $COMMIT_MSG_TEMPLATE"
             echo "- x86_64 目录: run/x86_64/$PKG_DIR_NAME"
             echo "- aarch64 目录: run/aarch64/$PKG_DIR_NAME"
             echo ""
@@ -355,7 +460,7 @@ jobs:
           echo "==> 结果总结 完成"
 
       # ---------------------------------------------------------------------
-      # 步骤 8：清理缓存和临时文件
+      # 步骤 9：清理缓存和临时文件
       # 始终执行，避免残留临时目录
       # ---------------------------------------------------------------------
       - name: 清理缓存和临时文件
